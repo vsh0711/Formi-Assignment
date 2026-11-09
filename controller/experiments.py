@@ -27,8 +27,8 @@ from .store import Store
 EXP_DIMS = ("welcome_message", "voice")
 
 P = {  # pre-registered parameters (also written into each experiment's `prereg` row)
-    "control_share": 0.40, "holdout": 0.20, "alpha_win": 0.05, "alpha_seg": 0.01, "alpha_harm_drop": 0.01,
-    "veto_z": 1.28, "veto_abs": 0.02, "tau_rel": 0.10, "n_min": 250, "n_seg_min": 300, "min_lift_rel": 0.02, "min_seg_lift_rel": 0.05,
+    "control_share": 0.50, "holdout": 0.25, "alpha_win": 0.05, "alpha_seg": 0.05, "alpha_harm_drop": 0.01,
+    "veto_z": 1.28, "veto_abs": 0.02, "tau_rel": 0.10, "n_min": 250, "n_seg_min": 200, "min_lift_rel": 0.02, "min_seg_lift_rel": 0.05,
     "max_days": 5.0, "min_days_left": 2.5, "min_conn_per_day": 120, "eval_every_min": 180,
     "mon_min_arm": 300, "mon_min_ctrl": 100, "decay_frac": 0.5, "mon_consecutive": 2, "drop_abs": 0.03,
     "max_override_cohorts": 4,
@@ -312,9 +312,11 @@ class Experiments:
             st["dropped"] += to_drop
             st["blacklist"] = sorted(set(st.get("blacklist", [])) | set(decaying))
             if new_arms:
-                k = len(new_arms)
-                cs = P["control_share"] if k > 1 else 0.5
-                alloc = {ctrl: cs, **{o: (1 - cs) / k for o in new_arms}}
+                # freed traffic goes back to the incumbent, NOT to the surviving arms: a survivor that has not been promoted
+                # yet may itself be fading, and exposure to unproven arms must only ever shrink
+                prev = st["alloc"]
+                alloc = {o: prev[o] for o in new_arms}
+                alloc[ctrl] = 1.0 - sum(alloc.values())
                 st["alloc"] = alloc
                 did = self.audit.decision(now, wf, "arm_dropped", f"{to_drop} not worth more traffic on {dim} "
                                           f"(decaying now: {decaying})",
@@ -357,14 +359,14 @@ class Experiments:
         return {"ok": ucb > -0.01, "pickup_delta": round(delta, 4), "pickup_ucb90": round(ucb, 4)}
 
     def _recency_ok(self, wf, dim, arm, ctrl, now, pooled_delta) -> dict:
-        """Novelty guard: the last day's lift must not be significantly below the pooled lift."""
-        strata = build_strata(self.agg, wf, dim, now // 1440 - 1)
-        r = contrast(strata, arm, ctrl, "eng")
+        """Novelty / decay guard: before promoting, the last ~36h of data on its own must still show at least half of the
+        pooled lift. Fading effects (novelty, fatigue) look great when averaged over their good days."""
+        r = self._recent(wf, dim, arm, ctrl, now, 6)
         if r is None or r[2] < 150 or r[3] < 150:
             return {"ok": True, "note": "not enough recent data to contradict"}
-        d, var = r[0], r[1]
-        z = (d - pooled_delta) / math.sqrt(var)
-        return {"ok": z > -2.0, "recent_delta": round(d, 4), "pooled_delta": round(pooled_delta, 4), "z": round(z, 2)}
+        d, se = r[0], r[1]
+        return {"ok": d >= 0.5 * pooled_delta, "recent_delta": round(d, 4), "recent_se": round(se, 4),
+                "pooled_delta": round(pooled_delta, 4), "rule": "recent 36h lift >= 50% of pooled lift"}
 
     # ------------------------------------------------------------------ conclusion (+ segment analysis)
     def _conclude(self, wf, spec, dim, e, now, strata, winner, look, snapshot, live):
@@ -503,7 +505,7 @@ class Experiments:
     # ------------------------------------------------------------------ monitoring: decay & harm after promotion
     def _monitor(self, wf, spec, dim, e, now, live, live_since):
         st = e["state"]
-        if now - st.get("last_mon", -10 ** 9) < 360 and now % 1440 != 0:
+        if now - st.get("last_mon", -10 ** 9) < 180 and now % 1440 != 0:
             return
         st["last_mon"] = now
         ctrl, h = e["control"], st.get("holdout", P["holdout"])

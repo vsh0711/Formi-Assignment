@@ -171,6 +171,8 @@ class Incidents:
         if inc:
             self._advance_incident(wf, spec, now, live, ver, inc)
             return
+        if now < self.st.get(f"halluc_suppress:{wf}:{cur}", -1):
+            return  # a recent paid validation showed this prompt is clean: do not re-spend on the same noise
         ref = self._reference_rate(wf, cur, now)
         hit = detect.halluc_check(self.agg, wf, cur, now, ref)
         if not hit:
@@ -184,7 +186,7 @@ class Incidents:
                   (iid, wf, "prompt_halluc", "open", now, json.dumps(state)))
         did = self.audit.decision(
             now, wf, "incident_detected", f"hallucination flag rate on {cur} is {hit['rate']:.1%} vs {hit['reference_rate']:.1%} reference",
-            "CUSUM on flag rate (h=8.5) + binomial confirmation p<=1e-3, >=100 connected", hit, "incident opened",
+            "CUSUM on flag rate (h=10) + binomial sanity check p<=1e-3, >=100 connected; then validation must confirm", hit, "incident opened",
             f"prompt {cur}: {hit['flagged']}/{hit['connected']} calls flagged ({hit['ratio']}x reference)")
         state["decision"] = did
         self.st.x("UPDATE incidents SET state=? WHERE id=?", (json.dumps(state), iid))
@@ -222,7 +224,7 @@ class Incidents:
         phase = state["phase"]
         gov = spec["governance"]
         # the world moved under us (supervisor changed the prompt again): re-assess from scratch
-        if phase in ("proposed", "verifying") and cur not in (state.get("chosen"), state["bad_prompt"]):
+        if phase in ("proposed", "verifying") and cur not in (state.get("chosen"), state["bad_prompt"], *state.get("tried", [])):
             state["phase"] = "closed"
             self.st.x("UPDATE incidents SET status='closed', closed_min=?, state=? WHERE id=?", (now, json.dumps(state), iid))
             self.plans.clear(wf, "prompt")
@@ -288,8 +290,35 @@ class Incidents:
                 out.append(p)
         return out
 
+    def _confirm_unsafe(self, wf, now, iid, state, gov) -> bool | None:
+        """The statistical alarm is only a trigger. A fresh validation run on the LIVE prompt is the arbiter, because the
+        automated flag detector is imperfect and a false alarm must never turn into a prompt change."""
+        bad = state["bad_prompt"]
+        if state.get("confirmed") is not None:
+            return state["confirmed"]
+        rec = self._validate(wf, now, iid, state, bad)
+        if rec is None:
+            return None
+        unsafe = not self._gate(rec, gov)
+        state["confirmed"] = unsafe
+        self.st.x("UPDATE incidents SET state=? WHERE id=?", (json.dumps(state), iid))
+        self.audit.decision(now, wf, "alarm_confirmation", f"validate live prompt {bad} before acting",
+                            "the flag detector is imperfect; validation is the arbiter", {"validation": rec},
+                            "UNSAFE - responding" if unsafe else "CLEAN - false alarm, no change",
+                            f"{bad}: validation pass_rate {rec['pass_rate']:.4f} ({rec['run_id']})")
+        if not unsafe:
+            state["phase"] = "closed"
+            self.st.x("UPDATE incidents SET status='closed', closed_min=?, state=? WHERE id=?", (now, json.dumps(state), iid))
+            self.st.put(f"halluc_suppress:{wf}:{bad}", now + 3 * 1440)
+            bads = [p for p in self.st.get(f"bad_prompts:{wf}", []) if p != bad]
+            self.st.put(f"bad_prompts:{wf}", bads)
+            self.audit.resolve_alert(now, wf, "prompt_hallucination")
+        return unsafe
+
     def _choose_fix(self, wf, spec, now, live, iid, state, gov):
         bad = state["bad_prompt"]
+        if not self._confirm_unsafe(wf, now, iid, state, gov):
+            return
         cands: list[str] = []
         chosen = None
         for p in self._lkg(wf, bad)[:1]:  # candidate #1: last known-good
@@ -304,6 +333,7 @@ class Incidents:
             cands.append(p)
             if ok:
                 chosen = p
+                state["ranked"] = [p]
         if chosen is None:
             if not self._spend_ok(state, 3):
                 self.audit.alert(now, "page", wf, "credits_low", f"no credits left to ask the LLM for alternatives ({self.credits_remaining})")
@@ -342,8 +372,11 @@ class Incidents:
                     passing.append((rec["failures"] / rec["n"], p))
             if passing:
                 # least restrictive prompt that clears the safety gate: validation is blind to engagement and strict
-                # scripts lose callers, so do not over-correct. Deterministic tie-break on name.
-                chosen = sorted(passing, key=lambda t: (-t[0], t[1]))[0][1]
+                # scripts lose callers, so do not over-correct. Deterministic tie-break on name. The rest stay as ranked
+                # fallbacks for the post-apply engagement canary.
+                ranked = [p for _, p in sorted(passing, key=lambda t: (-t[0], t[1]))]
+                state["ranked"] = ranked
+                chosen = ranked[0]
         state["candidates"] = cands
         if chosen is None:
             self.audit.alert(now, "page", wf, "no_safe_prompt", f"{wf}: no prompt cleared the safety gate; keep supervisor attention "
@@ -400,14 +433,35 @@ class Incidents:
             return  # not enough evidence yet either way
         pre = detect.tick_window(self.agg, wf, opened - 3 * 1440, opened)
         bad = state["bad_prompt"]
-        e_old = sum(v[2] for (d, p), v in pre.items() if p != bad)
-        c_old = sum(v[1] for (d, p), v in pre.items() if p != bad)
+        skip = {bad, *state.get("tried", [])}
+        e_old = sum(v[2] for (d, p), v in pre.items() if p not in skip)
+        c_old = sum(v[1] for (d, p), v in pre.items() if p not in skip)
         diff, z = two_prop(eng_new, n_new, e_old, c_old) if c_old >= 300 and n_new >= 200 else (0.0, 0.0)
         ok_eng = not (z <= -2.5 and diff <= -0.03)
         res = {"flag_rate": round(f_new / n_new, 4) if n_new else None, "reference": round(ref, 4), "connected_since_apply": n_new,
                "cusum_alarm": alarm, "engagement_new": round(eng_new / n_new, 4) if n_new else None,
                "engagement_before": round(e_old / c_old, 4) if c_old else None, "engagement_z": round(z, 2)}
         ok = alarm is None and ok_eng
+        if alarm is None and not ok_eng:  # safe but it costs callers: try the next validated candidate instead of living with it
+            bads = set(self.st.get(f"bad_prompts:{wf}", [])) | {chosen}
+            self.st.put(f"bad_prompts:{wf}", sorted(bads))
+            nxt = [p for p in state.get("ranked", []) if p not in bads and p != chosen]
+            self.audit.decision(now, wf, "engagement_canary_failed", f"{chosen} is safe but engagement fell {diff:+.3f} (z={z:.1f})",
+                                "post-apply canary: engagement z<=-2.5 and drop>=3pt vs pre-incident", res,
+                                f"fall back to {nxt[0]}" if nxt else "no validated fallback; escalating",
+                                f"{chosen} hurts engagement; next validated candidate: {nxt[0] if nxt else 'none'}")
+            if nxt:
+                rec = state["validated"][nxt[0]]
+                state["tried"] = state.get("tried", []) + [chosen]
+                state.update({"chosen": nxt[0], "phase": "proposed", "applied_min": None, "proposed_min": now})
+                self.st.x("UPDATE incidents SET state=? WHERE id=?", (json.dumps(state), iid))
+                self.plans.set_prompt(wf, nxt[0], {
+                    "kind": "incident_fix", "ref": iid, "urgent": True, "safety": True, "severity": 0.5, "reach": 1.0, "decision": None,
+                    "summary": f"replace prompt {chosen} with {nxt[0]}: {chosen} is safe but measurably lowers engagement",
+                    "rationale": f"engagement canary on {chosen}: {diff:+.3f} (z={z:.1f}); {nxt[0]} validated at pass_rate {rec['pass_rate']:.4f}",
+                    "evidence": {"validation_run_id": rec["run_id"]}, "evidence_text": f"validation {rec['run_id']}",
+                    "projection": {"metric": "engagement_rate", "current": res["engagement_new"], "before": res["engagement_before"]}})
+                return
         state["phase"] = "closed" if ok else "failed"
         self.st.x("UPDATE incidents SET status=?, closed_min=?, state=? WHERE id=?",
                   ("closed" if ok else "failed", now, json.dumps(state), iid))
