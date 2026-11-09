@@ -27,7 +27,7 @@ from .store import Store
 EXP_DIMS = ("welcome_message", "voice")
 
 P = {  # pre-registered parameters (also written into each experiment's `prereg` row)
-    "control_share": 0.50, "holdout": 0.25, "alpha_win": 0.05, "alpha_seg": 0.05, "alpha_harm_drop": 0.01,
+    "control_share": 0.50, "holdout": 0.25, "stage1_holdout": 0.50, "stage2_after_min": 1440, "mon_buckets": 3, "alpha_win": 0.05, "alpha_seg": 0.05, "alpha_harm_drop": 0.01,
     "veto_z": 1.28, "veto_abs": 0.02, "tau_rel": 0.10, "n_min": 250, "n_seg_min": 200, "min_lift_rel": 0.02, "min_seg_lift_rel": 0.05,
     "max_days": 5.0, "min_days_left": 2.5, "min_conn_per_day": 120, "eval_every_min": 180,
     "mon_min_arm": 300, "mon_min_ctrl": 100, "decay_frac": 0.5, "mon_consecutive": 2, "drop_abs": 0.03,
@@ -359,21 +359,26 @@ class Experiments:
         return {"ok": ucb > -0.01, "pickup_delta": round(delta, 4), "pickup_ucb90": round(ucb, 4)}
 
     def _recency_ok(self, wf, dim, arm, ctrl, now, pooled_delta) -> dict:
-        """Novelty / decay guard: before promoting, the last ~36h of data on its own must still show at least half of the
-        pooled lift. Fading effects (novelty, fatigue) look great when averaged over their good days."""
-        r = self._recent(wf, dim, arm, ctrl, now, 6)
-        if r is None or r[2] < 150 or r[3] < 150:
-            return {"ok": True, "note": "not enough recent data to contradict"}
-        d, se = r[0], r[1]
-        return {"ok": d >= 0.5 * pooled_delta, "recent_delta": round(d, 4), "recent_se": round(se, 4),
-                "pooled_delta": round(pooled_delta, 4), "rule": "recent 36h lift >= 50% of pooled lift"}
+        """Novelty / decay guard. Fading effects look great averaged over their good days, so before promoting the data must
+        still show the lift *recently*: last ~36h >= 50% of the pooled lift AND last ~12h >= 25% of it (when there are enough
+        calls to say anything - otherwise no evidence contradicts the winner)."""
+        out = {"ok": True, "rule": "36h lift >= 50% of pooled and 12h lift >= 25% of pooled", "pooled_delta": round(pooled_delta, 4)}
+        r36 = self._recent(wf, dim, arm, ctrl, now, 6)
+        if r36 is not None and r36[2] >= 150 and r36[3] >= 150:
+            out["recent36_delta"] = round(r36[0], 4)
+            out["ok"] = r36[0] >= 0.5 * pooled_delta
+        r12 = self._recent(wf, dim, arm, ctrl, now, 2)
+        if r12 is not None and r12[2] >= 100 and r12[3] >= 100:
+            out["recent12_delta"] = round(r12[0], 4)
+            out["ok"] = out["ok"] and r12[0] >= 0.25 * pooled_delta
+        return out
 
     # ------------------------------------------------------------------ conclusion (+ segment analysis)
     def _conclude(self, wf, spec, dim, e, now, strata, winner, look, snapshot, live):
         ctrl = e["control"]
         seg = self._segments(wf, spec, dim, e, strata, winner, ctrl, live)
         snapshot["segments"] = seg["summary"]
-        h = P["holdout"]
+        h = P["stage1_holdout"]   # staged promotion: 50/50 first; the step to 75/25 must be earned (see _monitor)
         plan_alloc = {}
         if winner:
             plan_alloc["default"] = {winner: 1 - h, ctrl: h}
@@ -382,7 +387,7 @@ class Experiments:
         for cid, arm in seg["overrides"].items():
             plan_alloc[cid] = {arm: 1 - h, ctrl: h} if arm != ctrl else {ctrl: 1.0}
         needs_cohorts = list(seg["cohort_defs"].values())
-        e["state"].update({"winner": winner, "alloc": plan_alloc, "holdout": h, "overrides": seg["overrides"],
+        e["state"].update({"winner": winner, "alloc": plan_alloc, "holdout": h, "stage": 1, "overrides": seg["overrides"],
                            "L0": look.get(winner, {}).get("delta") if winner else None,
                            "L0_rel": look.get(winner, {}).get("rel") if winner else None,
                            "blacklist": sorted(set(e["state"].get("blacklist", [])) | set(e["state"]["dropped"]))})
@@ -510,7 +515,7 @@ class Experiments:
         st["last_mon"] = now
         ctrl, h = e["control"], st.get("holdout", P["holdout"])
         b_now = now // 360
-        b_from = max(b_now - 3, (e["promo_min"] or now) // 360)  # last 24h but never before the promotion went live
+        b_from = max(b_now - (P["mon_buckets"] - 1), (e["promo_min"] or now) // 360)  # last 18h, never before it went live
         rows = self.agg.wf("agg_arm6", wf)
         strata: dict = defaultdict(lambda: defaultdict(lambda: [0, 0, 0]))
         for (b6, ver, coh, d, opt), v in rows.items():
@@ -552,6 +557,10 @@ class Experiments:
         st["bad_streak"] = st.get("bad_streak", 0) + 1 if bad else 0
         if bad and st["bad_streak"] >= P["mon_consecutive"]:
             self._rollback(wf, dim, e, now, out, reasons)
+        elif (not bad and st.get("stage") == 1 and e["promo_min"] is not None and
+              now - e["promo_min"] >= P["stage2_after_min"] and out and
+              all(v.get("lift_24h") is not None and v["lift_24h"] >= P["decay_frac"] * (st.get("L0") or 0.0) for v in out.values())):
+            self._stage2(wf, dim, e, now, out)
         else:
             self._save(e, wf, dim, now)
             if now % 1440 == 0 or bad:
@@ -560,6 +569,28 @@ class Experiments:
                                     "WATCH (1 more bad look triggers rollback)" if bad else "ok",
                                     f"{dim}: " + ("; ".join(reasons) if bad else "promoted variant still beats the holdout"),
                                     experiment_id=e["id"])
+
+    def _stage2(self, wf, dim, e, now, evidence):
+        """The promoted variant has held its lift against a 50% holdout for 24h: now (and only now) widen it to 75/25."""
+        st, ctrl, h = e["state"], e["control"], P["holdout"]
+        plan_alloc = {}
+        if st.get("winner"):
+            plan_alloc["default"] = {st["winner"]: 1 - h, ctrl: h}
+        for cid, arm in st.get("overrides", {}).items():
+            plan_alloc[cid] = {arm: 1 - h, ctrl: h} if arm != ctrl else {ctrl: 1.0}
+        st.update({"stage": 2, "holdout": h, "alloc": plan_alloc})
+        e["status"] = "promoting"
+        self._save(e, wf, dim, now)
+        did = self.audit.decision(now, wf, "promotion_stage2", f"{dim}: promoted variant held its lift for 24h at 50/50",
+                                  "staged promotion: widen only after confirmation", evidence, "plan updated",
+                                  f"widen {dim} winner to {1 - h:.0%} (holdout {h:.0%})", experiment_id=e["id"])
+        for cid, dims in plan_alloc.items():
+            if cid == "default" and not st.get("winner"):
+                continue
+            self.plans.set_alloc(wf, cid, dim, dims, {
+                "kind": "promotion", "ref": e["id"], "urgent": False, "decision": did, "reach": 1.0,
+                "summary": f"widen the {dim} winner from 50% to {1 - h:.0%} ({cid if cid != 'default' else 'everyone'}) - it held its lift for 24h",
+                "lift_rel_lcb": (st.get("L0_rel") or 0.0) * 0.5, "exploration": False})
 
     def _rollback(self, wf, dim, e, now, evidence, reasons):
         ctrl = e["control"]

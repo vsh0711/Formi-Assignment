@@ -8,9 +8,9 @@
 
 ## 0. TL;DR
 - A resumable **service** (not a script): every 15 simulated minutes it ingests events into sufficient statistics, detects drift on populations, runs stratified always-valid experiments on welcome/voice, balances caller IDs, sets cohort call-time weights by *held-out* gain, answers hallucination incidents with a validated fix, monitors promoted winners against a holdout and rolls back decay — and every config change goes through `/approvals` or a policy-permitted auto-apply, with the reason stored in our own SQLite audit store (`python -m controller.explain`).
-- Results (deterministic, see §11): **public_01 +5.3% conclusion rate, public_02 +19.4%, public_03 +11.8%** vs the no-op baseline; harmful changes: 0 on public_02, 1 on public_01 and 1 on public_03 (a fading W3 variant promoted just before it faded — §11/§13); hallucinated calls on public_02 cut from 431 to 168; the prompt incident was fixed 330 min after the supervisor's edit (§7), the faded W3 variant was off the traffic within ~1 day of losing.
+- Results (deterministic, see §11): **public_01 +4.8% conclusion rate, public_02 +18.2%, public_03 +11.2%** vs the no-op baseline; harmful changes: 0 on public_02, 1 on public_01 and 1 on public_03 (a fading W3 variant promoted just before it faded, −3.0% / −1.5% — §11/§13); hallucinated calls on public_02 cut from 431 to 167; the prompt incident was fixed 330 min after the supervisor's edit (§7), the faded W3 variant was off the traffic within ~1 day of losing.
 - Reliability: a chaos test with 18+ hard kills (fault-injected at every write-ahead boundary + external `SIGKILL`) finishes **byte-identical** to the uninterrupted run (`reports/crash_recovery_public_02.md`). Decisions are bit-identical across Python hash seeds.
-- Scale: public_03 (≈650k dials/day, 12 workflows) in 123 s wall for 5 simulated days **including** ingesting 7 history days (≈ 25 s per simulated day vs. the 600 s target), ≈ 106k events/s live ingest, p95 decision lag 223 ms per 15-minute tick, peak RSS 409 MiB (§8).
+- Scale: public_03 (≈650k dials/day, 12 workflows) in 129 s wall for 5 simulated days **including** ingesting 7 history days (≈ 26 s per simulated day vs. the 600 s target), ≈ 101k events/s live ingest, p95 decision lag 232 ms per 15-minute tick, peak RSS 402 MiB (§8).
 - Cut on purpose: per-person call time, hierarchical shrinkage, fair-share across tenants (C15), history-based bootstrap beyond baselines (C3 partial), a real UI. Known weaknesses are in §13 — the most important one: exploration is not free and the grader's "harmful" label counts it.
 
 ---
@@ -38,7 +38,7 @@
 | C4 | Call-time optimisation | **Partial** | Per-**cohort** hour weights chosen by 2-fold day-parity cross-validation (held-out gain LCB ≥ 1%). Per-**person** (`lead_preferred_hour`) is cut. | Per-person needs ≥2 connected observations per person; returning share is only 20–40% and the table is capped at 200k entries — low expected value vs. the cohort lever. |
 | C5 | Caller-ID health | **Built** | Peer-relative detection (caller ID is randomised per call, so peers in the same ticks are an unconfounded control), bounded rotation, probe floor, recovery test, load-balancing by observed pickup. Worth the most lift in the public scenarios. | — |
 | C6 | Welcome/voice experimentation | **Built** | Crossed (factorial) design, stratified estimator, mSPRT+Holm, harm/futility/decay arm-drops, segment tier with Holm. | Hierarchical shrinkage for segments (§12). |
-| C7 | Winner promotion, decay, rollback | **Built** | Promotion with a 25% control holdout; 24-h lift vs holdout every 3 h; rollback after 2 consecutive bad looks; autonomy revoked on rollback. | Faster than 1 day needs a bigger holdout (a cost). |
+| C7 | Winner promotion, decay, rollback | **Built** | **Staged** promotion (50/50, widened to 75/25 only after 24 h of confirmed lift); recency guards (36 h and 12 h); 18-h lift vs holdout every 3 h; rollback after 2 consecutive bad looks; autonomy revoked on rollback. | A time-since-exposure prior (§11). |
 | C8 | Hallucination incidents | **Built** | detect (CUSUM) → confirm (validation) → last-known-good first, LLM only if needed → validated fix → approval → verify (flags + engagement canary + ranked fallback). | — |
 | C9 | Governance client | **Built** | Full FSM, write-ahead intents, batching, approver-hours/TTL-aware slots, apply-immediately, stale re-plan, bounded auto-apply, earned autonomy. | — |
 | C10 | Honest impact / affected / dry run | **Built (honest, model-based)** | See §6.4. Dry-run is a projection from randomised arm rates, labelled as such — the simulator cannot re-dial history. | — |
@@ -114,10 +114,10 @@ Claims were checked against the actual policies (`GET /workflows/{id}` → `gove
 
 ## 5. The learning loop
 - **Cohorts.** Statistics are stored at the finest grain (the lead's 4 features = "cell") and per `(config version, cohort id)` **stratum**, so any cohort can be evaluated later without re-reading events. A cohort is a predicate over cells with a canonical id; membership follows the simulator's first-match rule. Cohort partitions never mix features within a workflow (`Experiments.partition_features`), so first-match membership stays disjoint. **Minimum size** is a statistics question: ≥200 connected calls per arm per cell for any cohort-level claim, ≥250 per arm pooled; cells below that are not evaluated. **Fragmentation** is limited three ways: single-feature splits only, ≤4 override cohorts, and a split must beat the pooled policy on held-out data (schedule) or survive Holm (experiments).
-- **Experiment design.** Welcome and voice are sampled independently per call, so one crossed experiment estimates both main effects from the same calls (interaction is not assumed away — the promoted winners keep a holdout, which also catches a bad combination). Allocation is control-heavy (50%), candidates share the rest; harmful arms stop (always-valid p≤0.01 and lift≤−3pt), futile arms stop (90% upper bound below the 2% minimum lift), *fading* arms stop (last-36h lift significantly ≤0 while pooled lift>0). **Freed traffic returns to the incumbent, never to a surviving arm** (a survivor may itself be fading). Exploration vs exploitation: a fixed exploration budget until a pre-registered stop, then exploitation at 75/25 with a holdout.
-- **Deciding a winner.** Per arm: difference in engagement-among-connected, combined across strata with **sample-size (Mantel–Haenszel) weights** (inverse-variance weights depend on outcomes and inflated z on tiny cells — found and fixed in testing), mixture-SPRT always-valid p-value (running minimum stored), Holm across arms at α=0.05, plus: relative lift ≥ 2%, pickup guardrail UCB > −1pt, and a **recency guard** (last 36 h lift ≥ half the pooled lift). Segments are a separate tier tested **once** at conclusion with Holm over the pre-registered family (single-feature levels) at α=0.05 plus a 5% practical-lift floor; harm to a segment vetoes a promotion on a looser, safety-first threshold (z≤−1.28 and drop≥2pt). Deterministic: same counts → same decision; no randomness anywhere in `stats.py`.
+- **Experiment design.** Welcome and voice are sampled independently per call, so one crossed experiment estimates both main effects from the same calls (interaction is not assumed away — the promoted winners keep a holdout, which also catches a bad combination). Allocation is control-heavy (50%), candidates share the rest; harmful arms stop (always-valid p≤0.01 and lift≤−3pt), futile arms stop (90% upper bound below the 2% minimum lift), *fading* arms stop (last-36h lift significantly ≤0 while pooled lift>0). **Freed traffic returns to the incumbent, never to a surviving arm** (a survivor may itself be fading). Exploration vs exploitation: a fixed exploration budget until a pre-registered stop, then **staged exploitation**: 50/50 against the incumbent, widened to 75/25 only after 24 h of confirmed lift.
+- **Deciding a winner.** Per arm: difference in engagement-among-connected, combined across strata with **sample-size (Mantel–Haenszel) weights** (inverse-variance weights depend on outcomes and inflated z on tiny cells — found and fixed in testing), mixture-SPRT always-valid p-value (running minimum stored), Holm across arms at α=0.05, plus: relative lift ≥ 2%, pickup guardrail UCB > −1pt, and a **recency guard** (last 36 h lift ≥ half, and last 12 h lift ≥ a quarter, of the pooled lift). Segments are a separate tier tested **once** at conclusion with Holm over the pre-registered family (single-feature levels) at α=0.05 plus a 5% practical-lift floor; harm to a segment vetoes a promotion on a looser, safety-first threshold (z≤−1.28 and drop≥2pt). Deterministic: same counts → same decision; no randomness anywhere in `stats.py`.
   **False-winner rate** (tests/test_controller.py): A/A, 3 arms vs control, looked at 120 times: family-wise false-winner rate measured **1.0%** over 1,500 A/A runs (budget 5%; the test asserts ≤ 8% to tolerate Monte-Carlo noise), where naive peeking (any z>1.96 at any look) gives **38.9%**. The rule is conservative by design — the price is the 2–3 days to detect a +10% lift. Segment tier: simulated null any-finding 2.9% (Holm), power at load-scale volumes ≈ 85%, at dev-scale ≈ 30%.
-- **Decay and rollback.** After promotion, 24-h lift versus the 25% holdout is evaluated every 3 h from 6-hour buckets. Rollback after 2 consecutive looks with `lift ≤ −1pt & z≤−2` (harm) or `lift + 1.28se < 0.5 × promised lift` (decay); the arm is blacklisted and **autonomy for that dimension is revoked**. Typical reaction time ≈ 1 day (limited by holdout size: a bigger holdout is faster but costs the lift it is guarding).
+- **Decay and rollback.** After promotion, the last-18-h lift versus the holdout (50%, later 25%) is evaluated every 3 h from 6-hour buckets. Rollback after 2 consecutive looks with `lift ≤ −1pt & z≤−2` (harm) or `lift + 1.28se < 0.5 × promised lift` (decay); the arm is blacklisted and **autonomy for that dimension is revoked**. Typical reaction time ≈ 1 day (limited by holdout size; the staged 50% holdout makes the first day the most sensitive).
 - **Call time and caller ID.** Call time: per-cohort hour weights from attempt-standardised, shrunk pickup rates; the partition feature is chosen by held-out gain (train on even days, score on odd, and vice versa; adopt only if the gain's lower confidence bound ≥ 1%; weights floored at 0.25 because an omitted hour is weight 0). Caller ID: because the ID is randomised per call, peers in the same ticks are an unconfounded control: a number is *degraded* when pickup is statistically (z≥3.5) and materially (≤0.6×) below its peers over 6 h → rotate away in bounded steps down to a 3% probe floor, re-test after 48 h; the slow path spreads traffic by observed health (χ² homogeneity p≤0.01, ≥8% spread) and probes unmeasured IDs at 5%. Loaded numbers lose pickup too, so merely spreading calls across IDs is itself a large lift (KYC +10–19% pickup).
 - **Guardrail.** Per arm: pickup UCB gate before any promotion. Per workflow: `guardrail_status` every 6 h (48 h vs 8 days, absolute drop, z<−3) → ticket, or page at >1.5× the allowed drop.
 
@@ -144,8 +144,8 @@ Used only if `auto_apply.enabled`, every changed dim ∈ `allowed_dims`, and the
 
 ## 7. Incidents
 **Caller ID (`ks_cancel` D2 10:00).** Detection: peer-relative pickup z≥3.5 *and* ratio ≤0.6 over 6 h, ≥60 dials. Expected false-positive rate: <1% per workflow-day on a null (unit test: 400 null trials, ≤1% flagged; power ≥95% for a 3× drop). Response: auto-apply steps ≤`max_shift` every 30 min to a 3% probe floor. Timeline (public_02, deterministic): flagged D2 10:00 → detected D2 15:15 (needs ≥60 dials per number in the 6-h window) → share of the bad number cut from 50% to the 3% probe floor within 45 min (day-2 share 25.7% → 3.1% from day 3).
-**Hallucination (`ks_cancel` D3 11:30, supervisor ships P2).** Detection: Page's CUSUM on the flag rate vs the workflow's own pre-change reference (h=7.5, ≥100 connected calls); Monte-Carlo: P(false alarm per workflow per 30 days) ≈ 13%, median delay ≈ 2.3 h at 112 connected calls/hour (observed on public_02: 4.5 h after the edit, because the first hours are diluted by the old prompt's calls and the run needs ≥100 flagged-prompt calls). Because the alarm is only a *trigger*, a **paid validation run on the live prompt confirms it** (a clean run → "false alarm, no change", suppress 3 days — this is what turned an observed 13.6%-engagement-loss false switch in a stress scenario into 10 wasted credits). Then: last-known-good first (validated n=1000 against a safety gate: failure rate ≤1.5% and pass ≥ min+0.5pt, which also rejects P4's 2.75%); the LLM is called only if that fails, and then we take the *least restrictive* validated prompt (validation is blind to engagement and strict scripts lose callers); propose urgently with `evidence.validation_run_id` and a notice to the supervisor; **verify after apply**: the same CUSUM must stay quiet and engagement must not be significantly below the pre-incident level, otherwise fall back to the next validated candidate. Credits per incident: 20 (confirm + candidate), hard cap 60, floor 25 kept for other workflows.
-Timeline (public_02, from `scripts/timeline.py`): D3 11:30 edit → 11:45 supervisor edit seen, hold placed → 16:00 CUSUM alarm, validation of live P2 pass_rate 0.939 (**unsafe**), P1 validated 0.990, `fix_chosen`, urgent proposal → 16:37 approved → 17:00 applied (60 min after detection) → 20:15 `fix_verified` (flag rate 0.98% vs 1.44% reference on 307 calls). Credits: 20; LLM calls: 0.
+**Hallucination (`ks_cancel` D3 11:30, supervisor ships P2).** Detection: Page's CUSUM on the flag rate vs the workflow's own pre-change reference (h=7.5, ≥100 connected calls); Monte-Carlo: P(false alarm per workflow per 30 days) ≈ 13%, median delay ≈ 2.3 h at 112 connected calls/hour (observed on public_02: 4.5 h after the edit, because the first hours are diluted by the old prompt's calls and the run needs ≥100 flagged-prompt calls). Because the alarm is only a *trigger*, a **paid validation run on the live prompt confirms it** (a clean run → "false alarm, no change", suppress 3 days — this is what turned an observed 13.6%-engagement-loss false switch in a stress scenario into 10 wasted credits). Then: last-known-good first (validated n=1000 against a safety gate: failure rate ≤1.5% and pass ≥ min+0.5pt, which also rejects P4's 2.75%); the LLM is called only if that fails, and then we take the *least restrictive* validated prompt (validation is blind to engagement and strict scripts lose callers); propose urgently with `evidence.validation_run_id` and a notice to the supervisor; **verify after apply**: the same CUSUM must stay quiet and engagement must not be significantly below the pre-incident level, otherwise fall back to the next validated candidate. Credits per incident: 20 (confirm + candidate), 10 for a dismissed false alarm, hard cap 60, floor 25 kept for other workflows.
+Timeline (public_02, from `scripts/timeline.py`): D3 11:30 edit → 11:45 supervisor edit seen, hold placed → 16:00 CUSUM alarm, validation of live P2 pass_rate 0.939 (**unsafe**), P1 validated 0.990, `fix_chosen`, urgent proposal → 16:37 approved → 17:00 applied (60 min after detection) → 20:15 `fix_verified` (flag rate 0.98% vs 1.44% reference on 307 calls). Credits: 20; LLM calls: 0. (Later in the same run, D8 18:00, a CUSUM alarm on P1 was dismissed by a clean validation: 10 credits, no change.)
 
 ## 8. Scale
 Measured on `public_03_load` (`scripts/loadtest.sh` → `reports/load_public_03_load.md`; sim and controller on the same machine):
@@ -196,14 +196,14 @@ Lead-level (IRDAI): `python -m controller.explain --db … --lead ks_cancel:l000
 ### public_01_dev (`reports/public_01.md`)
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.356 | +4.4% | 0.246 | +0.5% | 0.506 | +2.8% | 6% | 65 (57) |
-| nw_kyc | 0.404 | +10.2% | 0.266 | +10.0% | 0.598 | +0.2% | 0% | 27 (21) |
-| nw_renewal | 0.431 | +3.5% | 0.269 | +1.7% | 0.549 | +1.3% | 10% | 51 (54) |
-| ALL | 0.391 | +5.3% | 0.258 | +2.7% | 0.540 | +1.9% | 6% | 143 (132) |
+| ks_cancel | 0.355 | +4.1% | 0.247 | +0.8% | 0.503 | +2.3% | 6% | 65 (57) |
+| nw_kyc | 0.399 | +8.9% | 0.267 | +10.5% | 0.589 | -1.3% | 0% | 23 (21) |
+| nw_renewal | 0.430 | +3.4% | 0.266 | +0.8% | 0.553 | +2.1% | 10% | 52 (54) |
+| ALL | 0.390 | +4.8% | 0.257 | +2.6% | 0.538 | +1.7% | 6% | 140 (132) |
 
 ## Changes applied by the controller
 
-17 applied — neutral: 11, beneficial: 5, harmful: 1
+18 applied — neutral: 12, beneficial: 5, harmful: 1
 
 - nw_renewal v2 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=-0.008 → **neutral**
 - ks_cancel v2 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.008 → **neutral**
@@ -214,26 +214,27 @@ Lead-level (IRDAI): `python -m controller.explain --db … --lead ks_cancel:l000
 - ks_cancel v5 (controller_auto) dims=['welcome_message'] engageΔ=+0.005 didΔ=+0.000 → **neutral**
 - nw_renewal v4 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.009 → **neutral**
 - nw_renewal v5 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.002 → **neutral**
-- nw_renewal v6 (controller_approved) dims=['welcome_message'] engageΔ=-0.048 didΔ=+0.000 → **harmful**
-- nw_kyc v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.019 → **neutral**
+- nw_renewal v6 (controller_approved) dims=['welcome_message'] engageΔ=-0.030 didΔ=+0.000 → **harmful**
 - nw_renewal v7 (controller_approved) dims=['voice'] engageΔ=-0.001 didΔ=+0.000 → **neutral**
+- nw_kyc v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.019 → **neutral**
 - ks_cancel v6 (controller_auto) dims=['welcome_message', 'voice'] engageΔ=-0.008 didΔ=+0.000 → **neutral**
 - ks_cancel v7 (controller_auto) dims=['welcome_message', 'voice'] engageΔ=-0.008 didΔ=+0.000 → **neutral**
 - ks_cancel v8 (controller_auto) dims=['welcome_message', 'voice'] engageΔ=-0.005 didΔ=+0.000 → **neutral**
-- nw_kyc v4 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.222 → **beneficial**
-- nw_renewal v8 (controller_approved) dims=['welcome_message'] engageΔ=+0.055 didΔ=+0.000 → **beneficial**
+- nw_kyc v4 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.225 → **beneficial**
+- nw_renewal v8 (controller_approved) dims=['welcome_message'] engageΔ=+0.036 didΔ=+0.000 → **beneficial**
+- ks_cancel v9 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.003 → **neutral**
 
 ### public_02_incidents (`reports/public_02.md`)
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.337 | +43.2% | 0.238 | +31.3% | 0.487 | +4.2% | 30% | 82 (348) |
-| nw_kyc | 0.429 | +14.9% | 0.274 | +16.8% | 0.592 | -2.8% | 0% | 29 (29) |
-| nw_renewal | 0.452 | +4.3% | 0.279 | +6.2% | 0.544 | -1.9% | 13% | 57 (54) |
-| ALL | 0.395 | +19.4% | 0.259 | +18.0% | 0.530 | -0.6% | 21% | 168 (431) |
+| ks_cancel | 0.337 | +43.0% | 0.238 | +31.6% | 0.485 | +3.7% | 30% | 76 (348) |
+| nw_kyc | 0.402 | +7.5% | 0.257 | +9.5% | 0.594 | -2.4% | 0% | 31 (29) |
+| nw_renewal | 0.457 | +5.6% | 0.279 | +6.3% | 0.550 | -0.8% | 14% | 60 (54) |
+| ALL | 0.391 | +18.2% | 0.256 | +16.6% | 0.530 | -0.4% | 21% | 167 (431) |
 
 ## Changes applied by the controller
 
-22 applied — neutral: 13, beneficial: 9
+22 applied — neutral: 14, beneficial: 8
 
 - nw_renewal v2 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.016 → **neutral**
 - ks_cancel v2 (controller_auto) dims=['caller_id', 'schedule'] engageΔ=+0.000 didΔ=+0.008 → **neutral**
@@ -248,36 +249,36 @@ Lead-level (IRDAI): `python -m controller.explain --db … --lead ks_cancel:l000
 - ks_cancel v7 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.013 → **neutral**
 - ks_cancel v8 (controller_approved) dims=['prompt_version'] engageΔ=+0.102 didΔ=+0.000 → **beneficial**
 - ks_cancel v9 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.009 → **neutral**
-- nw_renewal v7 (controller_approved) dims=['welcome_message'] engageΔ=+0.012 didΔ=+0.000 → **beneficial**
+- nw_renewal v7 (controller_approved) dims=['welcome_message'] engageΔ=+0.009 didΔ=+0.000 → **neutral**
 - nw_renewal v8 (controller_approved) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
-- ks_cancel v10 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.014 → **neutral**
-- nw_renewal v9 (controller_approved) dims=['welcome_message'] engageΔ=+0.075 didΔ=+0.000 → **beneficial**
-- ks_cancel v11 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.012 → **neutral**
-- nw_kyc v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.014 → **neutral**
-- ks_cancel v12 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.008 → **neutral**
-- nw_kyc v4 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.227 → **beneficial**
+- ks_cancel v10 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.013 → **neutral**
+- nw_renewal v9 (controller_approved) dims=['welcome_message'] engageΔ=+0.049 didΔ=+0.000 → **beneficial**
+- ks_cancel v11 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.011 → **neutral**
+- nw_kyc v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.015 → **neutral**
+- nw_renewal v10 (controller_approved) dims=['voice'] engageΔ=+0.017 didΔ=+0.000 → **beneficial**
+- ks_cancel v12 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.009 → **neutral**
 - ks_cancel v13 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.005 → **neutral**
 
 ### public_03_load (`reports/public_03_load.md`)
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| arav_cancel_2 | 0.364 | +8.0% | 0.247 | +1.6% | 0.524 | +5.6% | 32% | 389 (409) |
-| arav_kyc_1 | 0.473 | +31.8% | 0.273 | +26.9% | 0.596 | -0.7% | 0% | 465 (352) |
-| arav_renewal_0 | 0.434 | +7.1% | 0.264 | +0.1% | 0.586 | +7.0% | 37% | 455 (408) |
-| kest_cancel_2 | 0.373 | +10.7% | 0.249 | +2.7% | 0.534 | +7.0% | 46% | 407 (418) |
-| kest_kyc_1 | 0.369 | +3.9% | 0.223 | +3.9% | 0.593 | -0.7% | 0% | 398 (370) |
-| kest_renewal_0 | 0.431 | +7.3% | 0.264 | -0.1% | 0.577 | +6.0% | 31% | 437 (403) |
-| nort_cancel_2 | 0.340 | +0.3% | 0.246 | +0.9% | 0.497 | -0.3% | 0% | 370 (368) |
-| nort_kyc_1 | 0.429 | +20.6% | 0.252 | +17.2% | 0.593 | -0.5% | 0% | 425 (318) |
-| nort_renewal_0 | 0.436 | +7.7% | 0.265 | +0.3% | 0.585 | +6.8% | 37% | 449 (419) |
-| tide_cancel_2 | 0.367 | +6.8% | 0.246 | +0.8% | 0.530 | +5.7% | 41% | 397 (401) |
-| tide_kyc_1 | 0.469 | +31.5% | 0.271 | +26.0% | 0.595 | -0.6% | 0% | 412 (376) |
-| tide_renewal_0 | 0.434 | +7.3% | 0.265 | +0.2% | 0.581 | +6.5% | 34% | 421 (425) |
-| ALL | 0.410 | +11.8% | 0.255 | +6.1% | 0.567 | +3.8% | 21% | 5025 (4667) |
+| arav_cancel_2 | 0.367 | +9.0% | 0.247 | +1.4% | 0.529 | +6.5% | 38% | 405 (409) |
+| arav_kyc_1 | 0.431 | +20.2% | 0.252 | +17.3% | 0.596 | -0.8% | 0% | 421 (352) |
+| arav_renewal_0 | 0.430 | +6.0% | 0.265 | +0.4% | 0.578 | +5.5% | 33% | 404 (408) |
+| kest_cancel_2 | 0.366 | +8.8% | 0.248 | +2.1% | 0.526 | +5.4% | 37% | 402 (418) |
+| kest_kyc_1 | 0.390 | +9.7% | 0.231 | +7.9% | 0.596 | -0.3% | 0% | 383 (370) |
+| kest_renewal_0 | 0.429 | +6.7% | 0.265 | +0.1% | 0.572 | +5.1% | 24% | 414 (403) |
+| nort_cancel_2 | 0.345 | +1.7% | 0.249 | +1.8% | 0.498 | -0.1% | 0% | 387 (368) |
+| nort_kyc_1 | 0.463 | +30.1% | 0.269 | +25.2% | 0.592 | -0.5% | 0% | 435 (318) |
+| nort_renewal_0 | 0.434 | +7.2% | 0.265 | +0.3% | 0.584 | +6.6% | 33% | 433 (419) |
+| tide_cancel_2 | 0.368 | +7.1% | 0.249 | +1.8% | 0.527 | +5.1% | 37% | 362 (401) |
+| tide_kyc_1 | 0.433 | +21.6% | 0.252 | +17.4% | 0.598 | +0.1% | 0% | 394 (376) |
+| tide_renewal_0 | 0.433 | +7.1% | 0.265 | +0.3% | 0.581 | +6.5% | 32% | 404 (425) |
+| ALL | 0.408 | +11.2% | 0.255 | +5.7% | 0.565 | +3.6% | 19% | 4844 (4667) |
 
 ## Changes applied by the controller
 
-45 applied — neutral: 21, beneficial: 23, harmful: 1
+56 applied — neutral: 28, beneficial: 27, harmful: 1
 
 - nort_renewal_0 v2 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=-0.009 → **neutral**
 - nort_cancel_2 v2 (controller_auto) dims=['caller_id', 'schedule'] engageΔ=+0.000 didΔ=+0.008 → **neutral**
@@ -295,41 +296,52 @@ Lead-level (IRDAI): `python -m controller.explain --db … --lead ks_cancel:l000
 - nort_renewal_0 v3 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.051 didΔ=+0.000 → **beneficial**
 - tide_kyc_1 v2 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.052 → **beneficial**
 - arav_kyc_1 v2 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.055 → **beneficial**
-- tide_cancel_2 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.077 didΔ=+0.000 → **beneficial**
-- kest_cancel_2 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.076 didΔ=+0.000 → **beneficial**
+- tide_cancel_2 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.055 didΔ=+0.000 → **beneficial**
+- kest_cancel_2 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.054 didΔ=+0.000 → **beneficial**
 - nort_kyc_1 v2 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.061 → **beneficial**
 - arav_cancel_2 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.025 didΔ=+0.000 → **beneficial**
 - kest_kyc_1 v2 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.045 → **beneficial**
-- tide_kyc_1 v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.429 → **beneficial**
-- nort_renewal_0 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.058 didΔ=+0.000 → **beneficial**
-- arav_renewal_0 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.057 didΔ=+0.000 → **beneficial**
+- arav_renewal_0 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.022 didΔ=+0.000 → **beneficial**
+- nort_renewal_0 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.023 didΔ=+0.000 → **beneficial**
+- arav_cancel_2 v5 (controller_approved) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
+- tide_renewal_0 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.023 didΔ=+0.000 → **beneficial**
+- arav_cancel_2 v6 (controller_approved) dims=['voice'] engageΔ=+0.028 didΔ=+0.000 → **beneficial**
+- arav_cancel_2 v7 (controller_auto) dims=['welcome_message'] engageΔ=+0.006 didΔ=+0.000 → **neutral**
 - kest_renewal_0 v3 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.051 didΔ=+0.000 → **beneficial**
-- arav_kyc_1 v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.512 → **beneficial**
-- tide_renewal_0 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.058 didΔ=+0.000 → **beneficial**
-- arav_cancel_2 v5 (controller_auto) dims=['voice'] engageΔ=+0.017 didΔ=+0.000 → **beneficial**
-- arav_cancel_2 v6 (controller_auto) dims=['voice'] engageΔ=+0.016 didΔ=+0.000 → **beneficial**
-- arav_cancel_2 v7 (controller_auto) dims=['voice'] engageΔ=+0.016 didΔ=+0.000 → **beneficial**
-- nort_kyc_1 v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.461 → **beneficial**
-- nort_renewal_0 v5 (controller_approved) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
-- kest_renewal_0 v4 (controller_approved) dims=['welcome_message'] engageΔ=+0.059 didΔ=+0.000 → **beneficial**
-- nort_renewal_0 v6 (controller_approved) dims=['voice'] engageΔ=-0.001 didΔ=+0.000 → **neutral**
-- kest_cancel_2 v5 (controller_auto) dims=['welcome_message'] engageΔ=+0.006 didΔ=+0.000 → **neutral**
-- kest_cancel_2 v6 (controller_auto) dims=['welcome_message'] engageΔ=+0.006 didΔ=+0.000 → **neutral**
-- kest_cancel_2 v7 (controller_auto) dims=['welcome_message'] engageΔ=+0.003 didΔ=+0.000 → **neutral**
-- arav_cancel_2 v8 (controller_auto) dims=['welcome_message'] engageΔ=-0.006 didΔ=+0.000 → **neutral**
-- tide_cancel_2 v5 (controller_auto) dims=['welcome_message'] engageΔ=-0.006 didΔ=+0.000 → **neutral**
-- arav_cancel_2 v9 (controller_auto) dims=['welcome_message'] engageΔ=-0.002 didΔ=+0.000 → **neutral**
-- tide_cancel_2 v6 (controller_auto) dims=['welcome_message'] engageΔ=-0.002 didΔ=+0.000 → **neutral**
-- kest_kyc_1 v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.403 → **beneficial**
+- arav_cancel_2 v8 (controller_auto) dims=['welcome_message'] engageΔ=+0.002 didΔ=+0.000 → **neutral**
+- nort_kyc_1 v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.556 → **beneficial**
+- tide_cancel_2 v5 (controller_auto) dims=['voice'] engageΔ=+0.016 didΔ=+0.000 → **beneficial**
+- kest_cancel_2 v5 (controller_auto) dims=['voice'] engageΔ=+0.016 didΔ=+0.000 → **beneficial**
+- tide_cancel_2 v6 (controller_auto) dims=['voice'] engageΔ=+0.004 didΔ=+0.000 → **neutral**
+- kest_cancel_2 v6 (controller_auto) dims=['voice'] engageΔ=+0.004 didΔ=+0.000 → **neutral**
+- arav_kyc_1 v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.411 → **beneficial**
+- tide_kyc_1 v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.410 → **beneficial**
+- nort_renewal_0 v5 (controller_approved) dims=['voice'] engageΔ=-0.001 didΔ=+0.000 → **neutral**
+- arav_renewal_0 v5 (controller_approved) dims=['welcome_message'] engageΔ=+0.034 didΔ=+0.000 → **beneficial**
 - tide_renewal_0 v5 (controller_approved) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
-- kest_renewal_0 v5 (controller_approved) dims=['cohorts', 'voice'] engageΔ=+0.022 didΔ=+0.000 → **beneficial**
-- tide_renewal_0 v6 (controller_approved) dims=['welcome_message'] engageΔ=-0.018 didΔ=+0.000 → **harmful**
+- nort_renewal_0 v6 (controller_approved) dims=['welcome_message'] engageΔ=+0.034 didΔ=+0.000 → **beneficial**
+- kest_renewal_0 v4 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=+0.024 didΔ=+0.000 → **beneficial**
+- arav_cancel_2 v9 (controller_auto) dims=['voice'] engageΔ=+0.016 didΔ=+0.000 → **beneficial**
+- arav_cancel_2 v10 (controller_auto) dims=['voice'] engageΔ=+0.004 didΔ=+0.000 → **neutral**
+- tide_renewal_0 v6 (controller_approved) dims=['welcome_message'] engageΔ=+0.034 didΔ=+0.000 → **beneficial**
+- arav_cancel_2 v11 (controller_auto) dims=['schedule'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
+- arav_cancel_2 v12 (controller_auto) dims=['welcome_message'] engageΔ=+0.006 didΔ=+0.000 → **neutral**
+- arav_cancel_2 v13 (controller_auto) dims=['welcome_message'] engageΔ=+0.002 didΔ=+0.000 → **neutral**
+- kest_kyc_1 v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.415 → **beneficial**
+- kest_renewal_0 v5 (controller_approved) dims=['voice'] engageΔ=-0.001 didΔ=+0.000 → **neutral**
+- tide_cancel_2 v7 (controller_auto) dims=['welcome_message'] engageΔ=-0.006 didΔ=+0.000 → **neutral**
+- kest_cancel_2 v7 (controller_auto) dims=['welcome_message'] engageΔ=-0.006 didΔ=+0.000 → **neutral**
+- tide_cancel_2 v8 (controller_auto) dims=['welcome_message'] engageΔ=-0.002 didΔ=+0.000 → **neutral**
+- kest_cancel_2 v8 (controller_auto) dims=['welcome_message'] engageΔ=-0.002 didΔ=+0.000 → **neutral**
+- kest_renewal_0 v6 (controller_approved) dims=['welcome_message'] engageΔ=+0.034 didΔ=+0.000 → **beneficial**
+- nort_renewal_0 v7 (controller_approved) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
+- nort_renewal_0 v8 (controller_approved) dims=['welcome_message'] engageΔ=-0.015 didΔ=+0.000 → **harmful**
 
-**Reading them.** Conclusion rate is up on every workflow of every public scenario (+5.3% / +19.4% / +11.8% overall). The big movers are *pickup* levers: caller-ID health and spreading (ks_cancel +43% on public_02, KYC +10–32%); engagement levers add +2–8% on the engagement-primary workflows (3–46% of the hidden engagement headroom, 21% overall on the two bigger scenarios). KYC (pickup-primary) shows engagement −1…−3% *relative* while pickup rises 10–30%: composition (more marginal callers answer), within the absolute guardrail, and watched by `guardrail_status`.
-**Where I was harmful:** exactly one change on public_01 (nw_renewal W3 promotion, −4.8% expected engagement at apply time) and one on public_03 (tide_renewal W3, −1.8%) — the same mechanism: a variant whose lift fades after ~2 days of exposure was promoted just before it faded (recency guard cannot see a fade that has not started yet); the decay monitor rolled both back within ~1.5 days. public_02 has none (W3 was caught at the holdout and rolled back; its share fell from 54% to 8% to 0% on consecutive days). The adversarial `stress_a` scenario additionally shows the exploration cost (§13). **What I'd change:** staged promotion for variants with ≥2 days of exposure; a faster decay monitor if the client accepts a larger holdout.
-**Incidents on public_02:** caller ID flagged D2 10:00 → detected 15:15 → traffic share of the bad number 25.7% (day 2) → 3.1% (day 3+); prompt P2 shipped D3 11:30 → alarm 16:00 → validated and proposed at 16:00 → approved 16:37 → live 17:00: **time-to-fix 330 min**, of which 270 min is detection volume (≈ 112 connected calls/hour) and 60 min the approver. Hallucinated calls 431 → 168.
+**Reading them.** Conclusion rate is up on every scenario (+4.8% / +18.2% / +11.2% overall). The big movers are *pickup* levers: caller-ID health and spreading (ks_cancel +43% on public_02, KYC +9–30%); engagement levers add +2–7% on engagement-primary workflows (≈ 6–46% of the hidden engagement headroom, 19–21% on the two bigger scenarios). KYC (pickup-primary) shows engagement −1…−2% *relative* while pickup rises 9–30%: composition (more marginal callers answer), inside the absolute guardrail, and watched by `guardrail_status`.
+**Where I was harmful:** one change on public_01 (nw_renewal W3 promotion, −3.0% expected engagement at apply time) and one on public_03 (nort_renewal_0 W3, −1.5%), none on public_02. Same mechanism both times: the variant's lift fades after ~2 days of exposure and the fade starts *after* the decision (at decision time the last-12h lift was still +0.10, so no data-driven guard could have seen it). Staged promotion (50/50 first, 75/25 only after 24 h of confirmed lift) cut the public_01 damage from −4.8% to −3.0% and the decay monitor (18-h window, every 3 h, two consecutive looks) rolled both back in ≈ 1 day. public_02: W3's share fell 44% → 5% → 0% on consecutive days. The adversarial `stress_a` scenario additionally shows the exploration cost (§13). **What I'd still change:** a time-since-first-exposure prior (effects in this domain fade) that caps any winner at 50% until it has survived ~4 days of exposure.
+**Incidents on public_02:** caller ID flagged D2 10:00 → detected 15:15 → bad number's traffic share 25.7% (day 2) → 3.1% (day 3+); prompt P2 shipped D3 11:30 → alarm 16:00 → validated & proposed 16:00 → approved 16:37 → live 17:00: **time-to-fix 330 min** (270 min is detection volume at ≈112 connected calls/hour, 60 min the approver). Hallucinated calls 431 → 167. The same run contains the false-alarm path working as designed: D8 18:00 CUSUM alarm on P1 → validation clean (pass 0.990) → *no change*, 10 credits (30 total = 20 incident + 10 dismissed alarm; 0 LLM calls).
 
-Also in `reports/`: `stress_a.md`, `stress_b.md` (synthetic scenarios with different truth/policy/incidents, to avoid overfitting the public ones), `crash_recovery_public_0(1, 2).md`, `load_public_03_load.md`.
+Also in `reports/`: `stress_a.md`, `stress_b.md` (synthetic scenarios with different truth/policy/incidents, so the public ones are not overfitted), `crash_recovery_public_0{1,2}.md`, `load_public_03_load.md`.
 
 ## 12. Trade-offs & rejected alternatives
 | Option | Why considered | Why rejected / what instead |
@@ -346,7 +358,7 @@ Also in `reports/`: `stress_a.md`, `stress_b.md` (synthetic scenarios with diffe
 
 ## 13. Known weaknesses
 1. **Exploration has a price and the grader's "harmful" label counts it.** Under an adversarial truth (a −15% arm, `scenarios/stress_a.yaml`) starting a test is labelled harmful (−3.3% expected engagement at the moment of the change). The 50% control share bounds it; it is not zero.
-2. **Promotion right before a variant fades.** public_01's W3 is promoted at D5 (its daily lift series was +.096, .043, .055, .075, .018, −.01…) and costs ≈ 1.5 days at 75% exposure before the decay monitor rolls it back; public_03 shows the same once. Staged promotion (50% first) would cut that and also halve the benefit of real winners.
+2. **Promotion right before a variant fades.** In public_01 the W3 lift series was +.096, .043, .055, .075 and the last-12h lift at decision time was still +.10; the fade starts after the decision, so no recency guard can see it. Staged promotion caps the damage (−3.0%, ≈1 day) but does not remove it; public_03 shows it once (−1.5%).
 3. **Segment power at dev scale is low** (≈30%): cohort-specific winners are mostly invisible in 8-day, 1,000-call/day scenarios. Honest, but it leaves "engagement gap captured" low (≈6–20%).
 4. **Approval-only workflows are slow**: one routine request per day (policy cap 2–4, one reserved) means a test, its arm drop and its conclusion each cost a day.
 5. **Hallucination baseline is relative to the workflow's own history**: a prompt that was *always* bad is never flagged; a supervisor prompt that tanks engagement *without* hallucinating is not detected (no engagement regression detector for third-party prompt changes).
