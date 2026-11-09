@@ -17,8 +17,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 
-from . import cfgutil, detect
+from . import allocopt, cfgutil, detect
 from .audit import Audit
 from .plan import PlanStore
 from .simclient import Sim, SimError
@@ -100,8 +101,8 @@ class Incidents:
                                     {"dials": nd, "pickup": round(cd / nd, 4), "peer": round(rc / rn, 4)}, "released to the balancer",
                                     f"{d} may carry traffic again (balancer will ramp it)")
         if known_bad:
-            tgt, ev = detect.did_target(short if sum(v[0] for v in short.values()) >= 120 else long, live_dist, opts,
-                                        eta=3.0, min_dials=30)
+            tgt, ev = self._did_target(wf, short if sum(v[0] for v in short.values()) >= 120 else long, live_dist, opts, now,
+                                       known_bad, eta=3.0, min_dials=30)
             tgt = dict(tgt or live_dist)
             floor = 0.03
             for d in sorted(known_bad):
@@ -138,7 +139,7 @@ class Incidents:
             long24 = detect.by_did(detect.tick_window(self.agg, wf, now - 24 * 60, now))
             if sum(v[0] for v in long24.values()) < 200:
                 long24 = detect.by_did(detect.tick_window(self.agg, wf, now - 7 * 1440, now))
-            tgt, ev = detect.did_target(long24, live_dist, opts, eta=1.5)
+            tgt, ev = self._did_target(wf, long24, live_dist, opts, now, known_bad, eta=1.5, min_gain=0.01)
             if tgt and known_bad:
                 for d in sorted(known_bad):
                     tgt[d] = min(tgt.get(d, 0.0), 0.03)
@@ -157,6 +158,17 @@ class Incidents:
                                     "plan updated", f"caller_id -> {({k: round(v, 3) for k, v in tgt.items()})}")
             elif self.plans.get(wf)["why"].get("alloc:default:caller_id", {}).get("kind") == "did_balance":
                 self.plans.clear(wf, "alloc:default:caller_id")
+
+    def _did_target(self, wf, stats, live_dist, opts, now, known_bad, *, eta, min_dials=60, min_gain=0.0):
+        """Traffic target across caller IDs: the LP of controller/allocopt.py (default) or the old multiplicative heuristic
+        (CONTROLLER_DID_MODEL=heuristic, kept for A/B comparison and as the fallback if the solver returns no optimum)."""
+        if os.environ.get("CONTROLLER_DID_MODEL", "lp") == "lp":
+            gamma, gev = allocopt.estimate_gamma(self.agg, wf, opts, now, exclude=known_bad)
+            tgt, ev = allocopt.target(stats, live_dist, opts, gamma=gamma, gamma_ev=gev, min_dials=min_dials, parked=sorted(known_bad),
+                                     min_gain=min_gain)
+            if tgt is not None or ev.get("reason") != "solver did not return an optimum":
+                return tgt, ev
+        return detect.did_target(stats, live_dist, opts, eta=eta, min_dials=min_dials)
 
     def _open(self, wf: str, kind: str):
         r = self.st.one("SELECT id, opened_min, state FROM incidents WHERE wf=? AND kind=? AND status='open'", (wf, kind))

@@ -157,3 +157,65 @@ def test_did_balancer_moves_toward_health_and_keeps_floor():
     tgt, ev = detect.did_target(stats, {"D1": 0.5, "D2": 0.5}, ["D1", "D2", "D3", "D4"], eta=1.5)
     assert tgt["D2"] > tgt["D1"] and min(tgt.values()) >= 0.03 - 1e-9 and "D4" in tgt
     assert abs(sum(tgt.values()) - 1) < 1e-9
+
+
+# ----------------------------------------------------------------------------------------------- caller-ID LP (C5)
+def _lp_stats():
+    return {"A": [2000, 500], "B": [2000, 440], "C": [2000, 300], "D": [2000, 520]}
+
+
+def test_did_lp_is_a_valid_deterministic_allocation():
+    from controller import allocopt
+    live = {o: 0.25 for o in "ABCD"}
+    runs = [allocopt.target(_lp_stats(), live, list("ABCD"), gamma=0.5, gamma_ev={}) for _ in range(3)]
+    x, ev = runs[0]
+    assert x is not None and abs(sum(x.values()) - 1.0) < 1e-9
+    assert all(v >= 0.03 - 1e-9 for v in x.values()), "probe floor must hold"
+    assert all(abs(x[o] - 0.25) <= 0.4 + 1e-9 for o in x), "trust region must hold"
+    assert x["C"] < 0.25 < x["A"], "the weak ID loses traffic, a strong one gains"
+    assert runs[1][0] == x and runs[2][0] == x, "LP output must be identical across repeated solves"
+    assert ev["modelled_pickup_gain_rel"] > 0 and ev["shadow_price_of_traffic"] > 0
+
+
+def test_did_lp_load_response_spreads_traffic_and_never_concentrates():
+    from controller import allocopt
+    live = {o: 0.25 for o in "ABCD"}
+    x0, _ = allocopt.target(_lp_stats(), live, list("ABCD"), gamma=0.0, gamma_ev={})
+    x1, _ = allocopt.target(_lp_stats(), live, list("ABCD"), gamma=1.0, gamma_ev={})
+    assert max(x1.values()) < max(x0.values()), "a load-sensitive pool must be spread more than a load-free one"
+
+
+def test_did_lp_gate_and_parking_and_min_gain():
+    from controller import allocopt
+    live = {o: 0.25 for o in "ABCD"}
+    same = {o: [2000, 500] for o in "ABCD"}
+    x, ev = allocopt.target(same, live, list("ABCD"), gamma=0.5, gamma_ev={})
+    assert x is None and "no significant difference" in ev["reason"]
+    x, ev = allocopt.target(_lp_stats(), live, list("ABCD"), gamma=0.5, gamma_ev={}, parked=["C"])
+    assert x["C"] <= 0.03 + 1e-9, "a parked ID is capped at the probe floor"
+    x, ev = allocopt.target(_lp_stats(), live, list("ABCD"), gamma=0.5, gamma_ev={}, min_gain=0.5)
+    assert x is None and "not worth a config change" in ev["reason"]
+
+
+def test_gamma_estimator_recovers_load_sensitivity():
+    from controller import allocopt
+    rng = random.Random(7)
+    ticks, gamma_true = {}, 0.8
+    w = 0.5
+    for t in range(0, 7 * 96):
+        if t % 24 == 0:  # the split changes between 6-hour windows (as it does when the controller moves traffic)
+            w = rng.random()
+        shares = {"A": 0.25 + 0.2 * (w - 0.5), "B": 0.25 - 0.2 * (w - 0.5), "C": 0.25, "D": 0.25}
+        cell = {}
+        for o, s in shares.items():
+            d = int(1600 * s)
+            p = 0.3 * (1 - gamma_true * (s - 0.25))
+            cell[(o, "P1")] = [d, int(d * p), 0, 0]
+        ticks[t] = cell
+
+    class Agg:
+        pass
+    agg = Agg()
+    agg.ticks = {"w": ticks}
+    g, ev = allocopt.estimate_gamma(agg, "w", list("ABCD"), 7 * 96 * 15)
+    assert 0.5 < g < 1.1, (g, ev)
