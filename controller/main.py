@@ -16,7 +16,7 @@ import signal
 import sys
 import time
 
-from . import cohorts
+from . import cohorts, detect
 from .audit import Audit
 from .experiments import Experiments
 from .governance import Governance, Prefs
@@ -33,14 +33,39 @@ HOLD_DAYS = 3
 STEP = 15
 
 
+def _world_matches(st: Store, sim_state: dict) -> bool:
+    """Is the state file for THIS world? Same scenario name, and the simulator has not been restarted behind our back
+    (a restarted simulator is a new world: its event ids restart below our cursor)."""
+    fp = st.get("world")
+    if fp is None:
+        return True
+    if fp["scenario"] != sim_state["scenario"]:
+        return False
+    return sim_state["last_event_id"] >= st.get("last_event_id", 0) and sim_state["sim_minute"] >= st.get("max_minute", -10 ** 9) - 15
+
+
 class Controller:
-    def __init__(self, url: str, db: str, prefs_path: str | None = None, status_port: int | None = None):
+    def __init__(self, url: str, db: str, prefs_path: str | None = None, status_port: int | None = None,
+                 archive_dir: str | None = None):
         self.sim = Sim(url)
+        st0 = self.sim.state()
         self.st = Store(db)
+        if not _world_matches(self.st, st0):
+            import time as _t
+            self.st.db.close()
+            moved = f"{db}.stale-{int(_t.time())}"
+            if archive_dir and os.path.isdir(archive_dir):
+                os.replace(archive_dir, f"{archive_dir}.stale-{int(_t.time())}")
+            for suf in ("", "-wal", "-shm"):
+                if os.path.exists(db + suf):
+                    os.replace(db + suf, moved + suf)
+            log.warning("state file belongs to another world (scenario/simulator restarted): moved to %s, starting fresh", moved)
+            self.st = Store(db)
+        self.st.put("world", {"scenario": st0["scenario"], "end_minute": st0["end_minute"]})
         self.audit = Audit(self.st)
         self.plans = PlanStore(self.st)
         self.prefs = Prefs(prefs_path)
-        self.ing = Ingestor(self.st, self.sim)
+        self.ing = Ingestor(self.st, self.sim, archive_dir=archive_dir)
         self.exps = Experiments(self.st, self.ing.agg, self.audit, self.plans)
         self.gov = Governance(self.st, self.sim, self.audit, self.plans, self.prefs, self.ing.agg)
         self.inc = Incidents(self.st, self.sim, self.audit, self.plans, self.ing.agg)
@@ -132,6 +157,8 @@ class Controller:
                 self.sched.step(wf, spec, now, cfg, "schedule" in held or "cohorts" in held)
             self.gov.cycle(wf, spec, now, state["end_minute"])
             self._autonomy(wf, spec, now)
+            if now % 360 == 0:
+                self._watch_kpis(wf, spec, now)
         dt = (time.perf_counter() - t0) * 1000
         self.cycle_ms.append(dt)
         self.st.x("INSERT OR REPLACE INTO metrics VALUES(?,?,?)", (now, "cycle_ms", dt))
@@ -139,6 +166,22 @@ class Controller:
         self.st.x("INSERT OR REPLACE INTO metrics VALUES(?,?,?)", (now, "ingest_s", t_ing))
         self.st.x("INSERT OR REPLACE INTO metrics VALUES(?,?,?)", (now, "credits", state["credits_remaining"]))
         return n
+
+    def _watch_kpis(self, wf: str, spec: dict, now: int):
+        """Pickup and engagement are watched separately. A breached guardrail is a contract problem, so it is loud."""
+        g = detect.guardrail_status(self.ing.agg, wf, now, spec["objective"])
+        if g and g["breached"]:
+            self.audit.alert(now, "page" if g["drop"] > 1.5 * g["max_drop"] else "ticket", wf, "guardrail_breach",
+                             f"{wf}: guardrail {g['kpi']} fell {g['drop']:.3f} (allowed {g['max_drop']}) over 48h "
+                             f"({g['reference']} -> {g['recent']}). Check recent config versions in the audit store "
+                             f"(python -m controller.explain --workflow {wf}) before approving anything else.")
+            self.audit.decision(now, wf, "guardrail_breach", f"{g['kpi']} dropped {g['drop']:.3f}", "guardrail KPI vs its own past, z<-3",
+                                g, "alerted", f"{g['kpi']} {g['reference']} -> {g['recent']}")
+        elif g:
+            self.audit.resolve_alert(now, wf, "guardrail_breach")
+        for d in detect.kpi_drift(self.ing.agg, wf, now):
+            self.audit.alert(now, "ticket", wf, f"kpi_drift_{d['kpi']}",
+                             f"{wf}: {d['kpi']} moved {d['reference']} -> {d['recent']} (z={d['z']}). Informational: see audit decisions.")
 
     def _autonomy(self, wf: str, spec: dict, now: int):
         """Earned autonomy: a customer-facing dimension may be auto-applied (where the policy permits) once a human-approved
@@ -158,14 +201,18 @@ class Controller:
                     self.gov.grant(now, wf, dim, "one human-approved change has been live >=24h with no rollback")
 
     # ------------------------------------------------------------------ service loop
-    def run(self):
+    def run(self, max_cycles: int | None = None):
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stop", True))
         if self.status_port:
             from .status import serve
             serve(self, self.status_port)
         log.info("controller up; resuming from event %s", self.ing.last_event_id)
         t_start = time.time()
+        done = 0
         while not self.stop:
+            if max_cycles is not None and done >= max_cycles:
+                return  # (tests: simulate a process boundary)
+            done += 1
             try:
                 state = self.sim.state()
                 self.cycle(state)
@@ -197,12 +244,14 @@ def main():
     ap.add_argument("--db", default=os.environ.get("CONTROLLER_DB", "state/controller.db"))
     ap.add_argument("--prefs", default=os.environ.get("CONTROLLER_PREFS", "controller/preferences.yaml"))
     ap.add_argument("--status-port", type=int, default=int(os.environ.get("CONTROLLER_PORT", "0")) or None)
+    ap.add_argument("--archive", default=os.environ.get("CONTROLLER_ARCHIVE") or None,
+                    help="directory for the per-call exposure archive (compliance: which variant did a lead hear)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    Controller(a.url, a.db, a.prefs, a.status_port).run()
+    Controller(a.url, a.db, a.prefs, a.status_port, a.archive).run()
 
 
 if __name__ == "__main__":

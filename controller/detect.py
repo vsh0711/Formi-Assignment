@@ -195,3 +195,32 @@ def kpi_drift(agg, wf: str, now: int, *, recent_h: int = 24, ref_h: int = 72, z_
         if abs(z) >= z_crit and abs(diff) / max(be / bc, 1e-9) >= rel_min:
             out.append({"kpi": "engagement_rate", "recent": round(re_ / rc, 4), "reference": round(be / bc, 4), "z": round(z, 2)})
     return out
+
+
+def guardrail_status(agg, wf: str, now: int, objective: dict, *, recent_h: int = 48, ref_days: int = 8) -> dict | None:
+    """Does the workflow still respect its guardrail KPI? `guardrail: {<kpi>_max_drop: x}` is read as an absolute drop of the
+    guardrail KPI versus its own recent past. Reported separately from the primary KPI - never blended."""
+    g = (objective or {}).get("guardrail") or {}
+    if not g:
+        return None
+    key, thr = next(iter(g.items()))
+    kpi = key.replace("_max_drop", "")
+    r = tick_window(agg, wf, now - recent_h * 60, now)
+    b = tick_window(agg, wf, now - ref_days * 1440, now - recent_h * 60)
+    def tot(w):
+        d = c = e = 0
+        for v in w.values():
+            d += v[0]; c += v[1]; e += v[2]
+        return d, c, e
+    (rd, rc, re_), (bd, bc, be) = tot(r), tot(b)
+    if kpi == "pickup_rate":
+        rn, rk, bn, bk = rd, rc, bd, bc
+    elif kpi == "engagement_rate":
+        rn, rk, bn, bk = rc, re_, bc, be
+    else:
+        return None
+    if min(rn, bn) < 300:
+        return None
+    diff, z = two_prop(rk, rn, bk, bn)
+    return {"kpi": kpi, "recent": round(rk / rn, 4), "reference": round(bk / bn, 4), "drop": round(-diff, 4),
+            "max_drop": thr, "z": round(z, 2), "breached": (-diff) > thr and z < -3.0}

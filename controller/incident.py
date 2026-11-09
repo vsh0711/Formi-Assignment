@@ -99,14 +99,13 @@ class Incidents:
                                         eta=3.0, min_dials=30)
             tgt = dict(tgt or live_dist)
             floor = 0.03
-            freed = sum(max(0.0, tgt.get(d, 0.0) - floor) for d in known_bad)
-            for d in known_bad:
+            for d in sorted(known_bad):
                 tgt[d] = min(tgt.get(d, 0.0), floor)
             good = [o for o in opts if o not in known_bad]
             gs = sum(tgt.get(o, 0.0) for o in good) or 1.0
-            tgt = {**{o: tgt.get(o, 0.0) * (1 - sum(tgt[d] for d in known_bad if d in tgt)) / gs for o in good},
-                   **{d: tgt[d] for d in known_bad if d in tgt}}
-            parked = max(live_dist.get(d, 0.0) for d in known_bad)
+            tgt = {**{o: tgt.get(o, 0.0) * (1 - sum(tgt[d] for d in sorted(known_bad) if d in tgt)) / gs for o in good},
+                   **{d: tgt[d] for d in sorted(known_bad) if d in tgt}}
+            parked = max(live_dist.get(d, 0.0) for d in sorted(known_bad))
             if parked > floor + 0.03:
                 self.plans.set_alloc(wf, "default", "caller_id", tgt, {
                     "kind": "did_rotation", "ref": "did", "urgent": True, "safety": True, "severity": 0.5,
@@ -136,7 +135,7 @@ class Incidents:
                 long24 = detect.by_did(detect.tick_window(self.agg, wf, now - 7 * 1440, now))
             tgt, ev = detect.did_target(long24, live_dist, opts, eta=1.5)
             if tgt and known_bad:
-                for d in known_bad:
+                for d in sorted(known_bad):
                     tgt[d] = min(tgt.get(d, 0.0), 0.03)
                 tgt = cfgutil.round_dist(tgt)
             if tgt and cfgutil.tv(live_dist, tgt) >= 0.04:

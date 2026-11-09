@@ -9,14 +9,14 @@ CHANGE_DIMS = ["cohorts", "welcome_message", "voice", "caller_id", "prompt_versi
 
 def round_dist(d: dict, nd: int = 4) -> dict:
     """Normalise to sum 1, drop zero weights, round to nd decimals while keeping the sum exactly 1."""
-    d = {k: float(v) for k, v in d.items() if v and v > 0}
+    d = {k: float(v) for k, v in sorted(d.items()) if v and v > 0}   # sorted: sums/ties must not depend on dict or hash order
     s = sum(d.values())
     if s <= 0:
         raise ValueError("empty distribution")
     r = {k: round(v / s, nd) for k, v in d.items()}
     drift = round(1.0 - sum(r.values()), nd)
     if drift:
-        kmax = max(r, key=lambda k: r[k])
+        kmax = max(r, key=lambda k: (r[k], k))
         r[kmax] = round(r[kmax] + drift, nd)
     return {k: v for k, v in r.items() if v > 0}
 

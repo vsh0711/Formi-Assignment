@@ -115,14 +115,44 @@ def render(x: dict) -> str:
     return "\n".join(L)
 
 
+def lead_exposure(db_path: str, archive_dir: str, lead_id: str) -> dict:
+    """IRDAI question: why did THIS customer hear THAT on a given day? Calls come from our exposure archive; the reason a variant was
+    live is the config version's decision chain from the audit store."""
+    import glob, gzip
+    db = sqlite3.connect(db_path)
+    calls = []
+    for f in sorted(glob.glob(f"{archive_dir}/*.tsv.gz")):
+        with gzip.open(f, "rt") as fh:
+            for line in fh:
+                if lead_id in line:
+                    p = line.rstrip("\n").split("\t")
+                    if p[1] == lead_id:
+                        calls.append({"ts": p[0], "config_version": int(p[2]), "cohort": p[3], "welcome": p[4], "voice": p[5],
+                                      "caller_id": p[6], "prompt": p[7], "connected": p[8][0] == "1", "engaged": p[8][1] == "1",
+                                      "attempt": int(p[9])})
+    wf = lead_id.split(":")[0]
+    for c in calls:
+        r = db.execute("SELECT version,actor,dims,proposal_id FROM cfg_timeline WHERE wf=? AND version=?", (wf, c["config_version"])).fetchone()
+        if r:
+            pr = db.execute("SELECT payload FROM proposals WHERE proposal_id=?", (r[3],)).fetchone() if r[3] else None
+            c["live_because"] = {"version": r[0], "actor": r[1], "dims": json.loads(r[2]), "proposal_id": r[3],
+                                 "summary": (json.loads(pr[0]).get("summary") if pr else None)}
+    return {"lead_id": lead_id, "calls": calls}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
-    ap.add_argument("--workflow", required=True)
+    ap.add_argument("--workflow")
+    ap.add_argument("--lead", help="lead id: show the variants this customer heard and why they were live (needs --archive)")
+    ap.add_argument("--archive")
     ap.add_argument("--at", help="e.g. D3T14:00")
     ap.add_argument("--version", type=int)
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
+    if a.lead:
+        print(json.dumps(lead_exposure(a.db, a.archive, a.lead), indent=2))
+        return
     x = explain(a.db, a.workflow, parse_when(a.at) if a.at else None, a.version)
     print(json.dumps(x, indent=2) if a.json else render(x))
 

@@ -11,8 +11,10 @@ Design:
 """
 from __future__ import annotations
 
+import gzip
 import json
 import logging
+import os
 import time
 from collections import defaultdict
 
@@ -77,8 +79,11 @@ class Aggregates:
 
 
 class Ingestor:
-    def __init__(self, store: Store, sim: Sim, history_days_used: int = 7):
+    def __init__(self, store: Store, sim: Sim, history_days_used: int = 7, archive_dir: str | None = None):
         self.st, self.sim = store, sim
+        self.archive_dir = archive_dir
+        if archive_dir:
+            os.makedirs(archive_dir, exist_ok=True)
         self.history_days_used = history_days_used
         self.agg = Aggregates()
         self.leadcell: dict[str, str] = {}
@@ -142,6 +147,7 @@ class Ingestor:
         cfg_rows: list[tuple] = []
         max_id, nev, max_min = self.last_event_id, 0, self.max_minute
         last_id = self.last_event_id
+        arch: list[str] = [] if (self.archive_dir and kind == "events") else None
         feats_known = bool(self.st.get("features"))
         new_feats = None
 
@@ -165,6 +171,9 @@ class Ingestor:
                 c, e = (1 if conn else 0), (1 if eng else 0)
                 var, ver, coh = ev["variant"], ev["config_version"], ev["cohort_id"]
                 cell = leadcell.get(ev["lead_id"])
+                if arch is not None:  # compliance: which variant did this lead hear, under which config version
+                    arch.append(f"{ev['ts']}\t{ev['lead_id']}\t{ver}\t{coh}\t{var['welcome_message']}\t{var['voice']}\t"
+                                f"{var['caller_id']}\t{var['prompt_version']}\t{c}{e}\t{ev['attempt_no']}")
                 b6 = m // 360
                 for dim in AGENT_DIMS:
                     opt = var[dim]
@@ -231,6 +240,11 @@ class Ingestor:
                 cfg_rows.append((ev["workflow_id"], ev["version"], m, ev["actor"], json.dumps(ev["changed_dims"]),
                                  ev.get("proposal_id"), ev.get("approval_id")))
 
+        tmp_arch = None
+        if arch:  # written before the commit under a temp name, renamed after: a re-run of the chunk simply overwrites it
+            tmp_arch = os.path.join(self.archive_dir, f"{meta['chunk']:06d}.tsv.gz.tmp")
+            with gzip.open(tmp_arch, "wt", compresslevel=1) as fh:
+                fh.write("\n".join(arch) + "\n")
         maybe_crash("mid_ingest_before_commit")
         delta = {"agg_cell": cell_d, "agg_arm6": arm_d, "agg_hour": hour_d, "agg_tick": tick_d, "agg_day": day_d}
         st = self.st
@@ -252,6 +266,8 @@ class Ingestor:
             st.put("max_minute", max_min)
             st.put("events_total", self.events_total)
             st.put("cursor_events" if kind == "events" else "cursor_history", meta["chunk"])
+        if tmp_arch:
+            os.replace(tmp_arch, tmp_arch[:-4])
         maybe_crash("after_ingest_commit")
         # commit succeeded: now it is safe to expose to readers
         self.agg.merge(delta)
