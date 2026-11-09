@@ -1,0 +1,9 @@
+# Stakeholder preferences that are NOT part of the simulator contract (they come from the memos). They only ever make the
+# controller *more* conservative than the policy; they can never widen what the policy allows. Unknown tenants use defaults.
+defaults: {}
+tenants:
+  kestrel_finance:
+    # memo 04 (ops supervisor): max two requests a day, never before 11:00, tell me before a running campaign changes
+    max_requests_per_day: 2
+    earliest_send_hour: 11
+    notice_minutes: 60
