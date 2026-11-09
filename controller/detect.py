@@ -127,14 +127,15 @@ def _apply_floor(x: dict, floor: float) -> dict:
 
 
 # ----------------------------------------------------------------------------------------------- hallucination
-def halluc_check(agg, wf: str, current_prompt: str, now: int, ref_rate: float, *, h: float = 10.0, lookback_h: int = 48,
-                 min_conn: int = 100, confirm_p: float = 1e-3) -> dict | None:
+def halluc_check(agg, wf: str, current_prompt: str, now: int, ref_rate: float, *, h: float = 7.5, lookback_h: int = 48,
+                 min_conn: int = 100, confirm_p: float = 1.0) -> dict | None:
     """Page's CUSUM on the automated hallucination flag, tested against the same detector's reference rate.
     The detector is imperfect (false positives/negatives), so we never look at single calls: the statistic is a
     log-likelihood ratio of 'flag rate = reference' vs 'flag rate >= max(2.5x, +2pt)', accumulated over connected calls
     and reset at zero (so quiet history never builds credit). An alarm also needs a binomial confirmation on the calls
     since the run started. The alarm is only a *trigger*: the incident flow then confirms with a paid validation run, so a false alarm costs
-    credits, never a prompt change. Monte-Carlo (SUBMISSION s7): P(false alarm / 30 days) ~1%, median delay ~3.2h at 112 conn/h."""
+    ~10 credits, never a prompt change - which is why the threshold can favour speed. Monte-Carlo (SUBMISSION s7): P(false
+    alarm / 30 days / workflow) ~15%, median delay ~2.4h at 112 connected calls/hour."""
     p0 = min(max(ref_rate, 1e-3), 0.5)
     p1 = max(2.5 * p0, p0 + 0.02)
     a, b = math.log(p1 / p0), math.log((1 - p1) / (1 - p0))

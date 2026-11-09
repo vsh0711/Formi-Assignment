@@ -56,6 +56,11 @@ class Incidents:
         # ---- fast path: a degraded number (hours, not days). Short window, strong response, then it STOPS.
         short = detect.by_did(detect.tick_window(self.agg, wf, now - 6 * 60, now))
         flagged = {b["did"]: b for b in detect.did_degraded(short)}
+        # Never park so many numbers that the survivors get overloaded (a loaded number also loses pickup): at least two
+        # IDs (or half of them, if fewer than 4) must stay in service; the worst-ratio numbers are parked first.
+        room = max(0, len(opts) - max(2, (len(opts) + 1) // 2) - len(known_bad - set(flagged)))
+        keep = sorted(flagged, key=lambda d: (flagged[d]["ratio"], d))[:room + len(set(flagged) & known_bad)]
+        flagged = {d: flagged[d] for d in keep}
         fresh = [b for d, b in flagged.items() if d not in known_bad]
         reparked = [b for b in fresh if live_dist.get(b["did"], 0.0) <= 0.06]
         if reparked:  # already at its probe floor (expired park re-confirmed): remember it quietly, no new incident
@@ -185,7 +190,7 @@ class Incidents:
                   (iid, wf, "prompt_halluc", "open", now, json.dumps(state)))
         did = self.audit.decision(
             now, wf, "incident_detected", f"hallucination flag rate on {cur} is {hit['rate']:.1%} vs {hit['reference_rate']:.1%} reference",
-            "CUSUM on flag rate (h=10) + binomial sanity check p<=1e-3, >=100 connected; then validation must confirm", hit, "incident opened",
+            "CUSUM on flag rate (h=7.5, >=100 connected); a paid validation run on the live prompt must then confirm", hit, "incident opened",
             f"prompt {cur}: {hit['flagged']}/{hit['connected']} calls flagged ({hit['ratio']}x reference)")
         state["decision"] = did
         self.st.x("UPDATE incidents SET state=? WHERE id=?", (json.dumps(state), iid))

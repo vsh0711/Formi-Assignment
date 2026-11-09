@@ -4,14 +4,14 @@
 
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.350 | +48.6% | 0.241 | +32.9% | 0.498 | +6.4% | 30% | 91 (348) |
-| nw_kyc | 0.419 | +12.0% | 0.259 | +10.5% | 0.611 | +0.4% | 0% | 25 (29) |
-| nw_renewal | 0.456 | +5.2% | 0.280 | +6.9% | 0.545 | -1.7% | 13% | 56 (54) |
-| ALL | 0.400 | +20.9% | 0.258 | +17.5% | 0.537 | +0.9% | 21% | 172 (431) |
+| ks_cancel | 0.337 | +43.2% | 0.238 | +31.3% | 0.487 | +4.2% | 30% | 82 (348) |
+| nw_kyc | 0.429 | +14.9% | 0.274 | +16.8% | 0.592 | -2.8% | 0% | 29 (29) |
+| nw_renewal | 0.452 | +4.3% | 0.279 | +6.2% | 0.544 | -1.9% | 13% | 57 (54) |
+| ALL | 0.395 | +19.4% | 0.259 | +18.0% | 0.530 | -0.6% | 21% | 168 (431) |
 
 ## Changes applied by the controller
 
-23 applied — neutral: 14, beneficial: 9
+22 applied — neutral: 13, beneficial: 9
 
 - nw_renewal v2 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.016 → **neutral**
 - ks_cancel v2 (controller_auto) dims=['caller_id', 'schedule'] engageΔ=+0.000 didΔ=+0.008 → **neutral**
@@ -26,16 +26,15 @@
 - ks_cancel v7 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.013 → **neutral**
 - ks_cancel v8 (controller_approved) dims=['prompt_version'] engageΔ=+0.102 didΔ=+0.000 → **beneficial**
 - ks_cancel v9 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.009 → **neutral**
-- ks_cancel v10 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.007 → **neutral**
 - nw_renewal v7 (controller_approved) dims=['welcome_message'] engageΔ=+0.012 didΔ=+0.000 → **beneficial**
 - nw_renewal v8 (controller_approved) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
-- ks_cancel v11 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.010 → **neutral**
+- ks_cancel v10 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.014 → **neutral**
 - nw_renewal v9 (controller_approved) dims=['welcome_message'] engageΔ=+0.075 didΔ=+0.000 → **beneficial**
-- ks_cancel v12 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.006 → **neutral**
-- ks_cancel v13 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.006 → **neutral**
-- ks_cancel v14 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.004 → **neutral**
-- nw_kyc v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.237 → **beneficial**
-- nw_kyc v4 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=-0.000 → **neutral**
+- ks_cancel v11 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.012 → **neutral**
+- nw_kyc v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.014 → **neutral**
+- ks_cancel v12 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.008 → **neutral**
+- nw_kyc v4 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.227 → **beneficial**
+- ks_cancel v13 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.005 → **neutral**
 
 ## Governance
 
@@ -51,13 +50,13 @@
     "approver declined (judgement call)": 1
   },
   "applied_via_approval": 8,
-  "auto_applied": 15,
+  "auto_applied": 14,
   "auto_apply_rejected": 0,
   "apply_conflicts": 0,
   "lapsed": 0,
   "peak_requests_per_24h": {
     "nw_renewal": 3,
-    "nw_kyc": 1,
+    "nw_kyc": 2,
     "ks_cancel": 1
   }
 }
@@ -73,20 +72,20 @@
     "at": "D2 10:00",
     "flagged_did_share_by_day": {
       "2": 0.257,
-      "3": 0.032,
+      "3": 0.031,
       "4": 0.031,
-      "5": 0.03,
-      "6": 0.032,
-      "7": 0.025,
-      "8": 0.028,
-      "9": 0.03
+      "5": 0.031,
+      "6": 0.027,
+      "7": 0.029,
+      "8": 0.027,
+      "9": 0.028
     }
   },
   {
     "type": "supervisor_edit",
     "workflow": "ks_cancel",
     "at": "D3 11:30",
-    "mttr_minutes": 405,
+    "mttr_minutes": 330,
     "fixed_by": "controller_approved"
   },
   {
@@ -102,9 +101,9 @@
 ```
 {
   "nw_renewal:welcome_message=W3": {
-    "3": 0.233,
-    "4": 0.537,
-    "5": 0.076,
+    "3": 0.234,
+    "4": 0.536,
+    "5": 0.078,
     "6": 0.0,
     "7": 0.0,
     "8": 0.0,
