@@ -102,11 +102,15 @@ class Governance:
         return r[0]
 
     # =================================================================== the per-workflow cycle
+    def reconcile(self, wf: str, spec: dict, now: int):
+        """FIRST thing every cycle, before any planner runs: finish what was in flight (re-send write-ahead intents, poll
+        approvals, apply what was approved). Doing this before planning is what makes a restarted cycle replay exactly
+        like an uninterrupted one."""
+        live = self.sim.get(f"/workflows/{wf}/config")
+        self._reconcile(wf, spec, now, live["version"], live["config"])
+
     def cycle(self, wf: str, spec: dict, now: int, end_min: int):
         live = self.sim.get(f"/workflows/{wf}/config")
-        ver, cfg = live["version"], live["config"]
-        self._reconcile(wf, spec, now, ver, cfg)
-        live = self.sim.get(f"/workflows/{wf}/config")  # may have changed by an apply above
         ver, cfg = live["version"], live["config"]
         plan = self.plans.get(wf)
         target = target_config(cfg, plan)
@@ -194,7 +198,9 @@ class Governance:
     def _auto_step(self, wf, spec, now, ver, live, target, auto_dims, plan, pol):
         urgent = [d for d in auto_dims if self._urgent(plan, d)]
         dims = urgent or auto_dims
-        last = self.st.get(f"last_auto:{wf}", -10 ** 9)
+        # cooldown is derived from the proposals table (not from a side-effect we might lose in a crash window)
+        last = (self.st.one("SELECT MAX(decided_min) FROM proposals WHERE wf=? AND route='auto' AND status='applied'", (wf,)) or [None])[0]
+        last = -10 ** 9 if last is None else last
         if now - last < (STEP_COOLDOWN_MIN if urgent else 60):
             return
         part = self._partial(live, target, dims)
@@ -236,27 +242,36 @@ class Governance:
             res = self.sim.put(f"/workflows/{wf}/config", {"proposal_id": pid, "base_version": ver,
                                                          "proposed_config": stepped, "rationale": rationale,
                                                          "evidence": evidence})
-            self._set(pid, now, status="applied", applied_version=res["version"], decided_min=now)
-            self.st.put(f"last_auto:{wf}", now)
-            self.counters["auto_applies"] += 1
             maybe_crash("after_post_before_commit")
-            self.audit.decision(now, wf, "auto_applied", whys[0].get("summary", "plan change") if whys else "plan change",
-                                f"policy.auto_apply allows {sdims}; shift<={cap}", {"whys": whys, "from": ver},
-                                f"applied v{res['version']}", summary, proposal_id=pid, version=res["version"],
-                                parent_id=whys[0].get("decision") if whys else None)
-            self.audit.notice(now, spec["tenant_id"], wf, "applied", f"v{res['version']}: {summary}")
+            self._record_auto(wf, spec["tenant_id"], pid, now, res["version"], whys, sdims, cap, ver, summary)
         except SimError as e:
             self._handle_put_error(wf, pid, now, ver, e)
+
+    def _record_auto(self, wf, tenant, pid, now, version, whys, sdims, cap, ver, summary, recovered=False):
+        """Everything that must be true once an auto-apply happened, in ONE transaction (also used by crash recovery)."""
+        with self.st.tx():
+            self._set(pid, now, status="applied", applied_version=version, decided_min=now)
+            if not self.st.one("SELECT 1 FROM decisions WHERE proposal_id=? AND kind='auto_applied'", (pid,)):
+                self.audit.decision(now, wf, "auto_applied", whys[0].get("summary", "plan change") if whys else "plan change",
+                                    f"policy.auto_apply allows {sdims}; shift<={cap}" + (" [recorded after restart]" if recovered else ""),
+                                    {"whys": whys, "from": ver}, f"applied v{version}", summary, proposal_id=pid, version=version,
+                                    parent_id=whys[0].get("decision") if whys else None)
+                self.audit.notice(now, tenant, wf, "applied", f"v{version}: {summary}")
+        self.counters["auto_applies"] += 1
 
     def _handle_put_error(self, wf, pid, now, ver, e: SimError):
         if e.code == "duplicate_proposal_id":  # an earlier attempt (before a crash) succeeded
             hist = self.sim.get(f"/workflows/{wf}/config/history")
             hit = next((h for h in hist if h["proposal_id"] == pid), None)
             if hit:
-                self._set(pid, now, status="applied", applied_version=hit["version"], decided_min=now)
+                row = self.st.one("SELECT payload, dims, base_version FROM proposals WHERE proposal_id=?", (pid,))
+                payload = json.loads(row[0]) if row else {}
+                tenant = self.st.one("SELECT tenant FROM workflows WHERE wf=?", (wf,))[0]
                 self.audit.decision(now, wf, "recovered", f"auto-apply {pid} had already happened before a restart",
                                     "idempotent reconciliation", {"history_hit": hit}, f"linked to v{hit['version']}",
                                     "no double-apply: matched proposal_id in config history", proposal_id=pid)
+                self._record_auto(wf, tenant, pid, now, hit["version"], payload.get("whys", []), json.loads(row[1]) if row else [],
+                                  0, row[2] if row else ver, payload.get("summary", ""), recovered=True)
                 return
         if e.code == "stale_base_version":
             self._set(pid, now, status="stale")
@@ -368,16 +383,18 @@ class Governance:
                                  f"proposal_{e.code}", f"{pid} refused by the simulator ({e.code}): {e.detail}")
                 return
         maybe_crash("after_post_before_commit")
-        self._set(pid, now, status="pending", approval_id=res["approval_id"], submitted_min=now,
-                  expires_min=_parse_min(res["expires_at"]))
-        self.counters["proposals"] += 1
         spec_whys = payload.get("whys", [])
-        self.audit.decision(
-            now, wf, "proposal_submitted", payload.get("summary", ""), f"governance batch ({payload.get('slot_reason')})",
-            {"impact_score": body["impact_score"], "affected_leads": body["affected_leads"], "diff": body["diff"],
-             "dry_run": body["dry_run"], "cap": payload.get("cap_reason"), "urgent": bool(payload.get("urgent_dims"))},
-            f"{res['approval_id']} pending", body["change_summary"], proposal_id=pid, version=body["base_version"],
-            parent_id=spec_whys[0].get("decision") if spec_whys else None)
+        with self.st.tx():
+            self._set(pid, now, status="pending", approval_id=res["approval_id"], submitted_min=now,
+                      expires_min=_parse_min(res["expires_at"]))
+            if not self.st.one("SELECT 1 FROM decisions WHERE proposal_id=? AND kind='proposal_submitted'", (pid,)):
+                self.audit.decision(
+                    now, wf, "proposal_submitted", payload.get("summary", ""), f"governance batch ({payload.get('slot_reason')})",
+                    {"impact_score": body["impact_score"], "affected_leads": body["affected_leads"], "diff": body["diff"],
+                     "dry_run": body["dry_run"], "cap": payload.get("cap_reason"), "urgent": bool(payload.get("urgent_dims"))},
+                    f"{res['approval_id']} pending", body["change_summary"], proposal_id=pid, version=body["base_version"],
+                    parent_id=spec_whys[0].get("decision") if spec_whys else None)
+        self.counters["proposals"] += 1
 
     # =================================================================== reconcile in-flight proposals
     def _reconcile(self, wf: str, spec: dict, now: int, ver: int, live: dict):
@@ -386,7 +403,7 @@ class Governance:
                 self._submit(p["proposal_id"], now)
             else:
                 payload = json.loads(p["payload"])
-                self._retry_auto(p, payload, now, ver)
+                self._retry_auto(wf, p, payload, now, ver)
         for p in self._rows(wf, ("pending", "approved")):
             if p["route"] != "approval" or not p["approval_id"]:
                 continue
@@ -415,19 +432,21 @@ class Governance:
                                     "classified, backoff then re-propose", f"{st}: {reasons}", proposal_id=p["proposal_id"])
                 if st == "rejected":
                     self._classify_rejection(wf, p, reasons, now)
-            elif st == "applied":
-                self._set(p["proposal_id"], now, status="applied", applied_version=a.get("applied_version"))
+            elif st == "applied":  # we applied it but died before recording it (crash window): record it now
+                self._finish_apply(wf, p, a["approval_id"], now, None, recovered=True)
         # approvals that were approved while we were not looking and the window lapsed are caught by the 410 path
 
-    def _retry_auto(self, p, payload, now, ver):
+    def _retry_auto(self, wf, p, payload, now, ver):
         try:
-            res = self.sim.put(f"/workflows/{p['wf']}/config", {"proposal_id": p["proposal_id"], "base_version": p["base_version"],
+            res = self.sim.put(f"/workflows/{wf}/config", {"proposal_id": p["proposal_id"], "base_version": p["base_version"],
                                                               "proposed_config": payload["config"],
                                                               "rationale": self._rationale(payload["whys"]),
                                                               "evidence": {"dims": json.loads(p["dims"])}})
-            self._set(p["proposal_id"], now, status="applied", applied_version=res["version"], decided_min=now)
+            tenant = self.st.one("SELECT tenant FROM workflows WHERE wf=?", (wf,))[0]
+            self._record_auto(wf, tenant, p["proposal_id"], now, res["version"], payload.get("whys", []), json.loads(p["dims"]),
+                              0, p["base_version"], payload.get("summary", ""), recovered=True)
         except SimError as e:
-            self._handle_put_error(p["wf"], p["proposal_id"], now, p["base_version"], e)
+            self._handle_put_error(wf, p["proposal_id"], now, p["base_version"], e)
 
     def _apply(self, wf, p, a, now, ver):
         pid, aid = p["proposal_id"], p["approval_id"]
@@ -456,14 +475,24 @@ class Governance:
                     self._set(pid, now, status="applied", applied_version=ver)
             return
         maybe_crash("after_apply_before_record")
-        self._set(pid, now, status="applied", applied_version=res["version"])
-        self.counters["applies"] += 1
+        self._finish_apply(wf, p, aid, now, res["version"])
+
+    def _finish_apply(self, wf, p, aid, now, version, recovered=False):
+        pid = p["proposal_id"]
+        if version is None:  # find which version this approval produced
+            hit = next((h for h in self.sim.get(f"/workflows/{wf}/config/history") if h.get("approval_id") == aid), None)
+            version = hit["version"] if hit else None
         payload = json.loads(p["payload"])
-        self.audit.decision(now, wf, "applied", payload.get("summary", ""), "approved by client approver",
-                            {"approval_id": aid}, f"applied v{res['version']}", payload.get("summary", ""),
-                            proposal_id=pid, version=res["version"])
         tenant = self.st.one("SELECT tenant FROM workflows WHERE wf=?", (wf,))[0]
-        self.audit.notice(now, tenant, wf, "applied", f"v{res['version']}: {payload.get('summary', '')}")
+        with self.st.tx():
+            self._set(pid, now, status="applied", applied_version=version)
+            if not self.st.one("SELECT 1 FROM decisions WHERE proposal_id=? AND kind='applied'", (pid,)):
+                self.audit.decision(now, wf, "applied", payload.get("summary", ""),
+                                    "approved by client approver" + (" [recorded after restart]" if recovered else ""),
+                                    {"approval_id": aid}, f"applied v{version}", payload.get("summary", ""),
+                                    proposal_id=pid, version=version)
+                self.audit.notice(now, tenant, wf, "applied", f"v{version}: {payload.get('summary', '')}")
+        self.counters["applies"] += 1
 
     def _classify_rejection(self, wf, p, reasons, now):
         text = " ".join(reasons).lower()

@@ -26,7 +26,7 @@ from .plan import PlanStore
 from .schedule import Scheduler
 from .simclient import Sim, SimError, SimUnavailable
 from .store import Store
-from .util import maybe_crash, minute_to_str
+from .util import maybe_crash, minute_to_str, ts_to_minute
 
 log = logging.getLogger("controller")
 HOLD_DAYS = 3
@@ -110,7 +110,8 @@ class Controller:
         t_ing = time.perf_counter() - t0
         maybe_crash("after_sync")
         self._react(now)
-        rates = []
+        for wf, spec in self.specs.items():
+            self.gov.reconcile(wf, spec, now)
         for wf, spec in self.specs.items():
             live = self.sim.get(f"/workflows/{wf}/config")
             ver, cfg = live["version"], live["config"]
@@ -118,13 +119,17 @@ class Controller:
             if self.st.one("SELECT 1 FROM cfg_snapshots WHERE wf=? AND version=?", (wf, ver)) is None:
                 self.st.x("INSERT OR IGNORE INTO cfg_snapshots VALUES(?,?,?)", (wf, ver, _j.dumps(cfg)))
             held = self._holds(wf, now)
-            r = self.st.one("SELECT minute FROM cfg_timeline WHERE wf=? AND version=?", (wf, ver))
-            live_since = r[0] if r else -10 ** 6
+            # authoritative: the API says when this version went live (works even in the window between an apply and the
+            # next ingest, e.g. right after a restart); version 1 is the business default, "since forever"
+            live_since = ts_to_minute(live["applied_at"]) if live.get("applied_at") else -10 ** 6
             incident_open = bool(self.st.one("SELECT 1 FROM incidents WHERE wf=? AND status='open'", (wf,)))
-            self.inc.step_prompt(wf, spec, now, cfg, ver, state["credits_remaining"])
-            self.inc.step_did(wf, spec, now, cfg, "caller_id" in held)
-            self.exps.step(wf, spec, now, cfg, live_since, state["end_minute"], held, incident_open)
-            self.sched.step(wf, spec, now, cfg, "schedule" in held or "cohorts" in held)
+            self.inc.step_prompt(wf, spec, now, cfg, ver, state["credits_remaining"])   # may call LLM/validation (paid, persisted)
+            # The pure planning step touches only our own store: do it atomically, so a kill can never leave an experiment
+            # row and its plan entry out of step with each other.
+            with self.st.tx():
+                self.inc.step_did(wf, spec, now, cfg, "caller_id" in held)
+                self.exps.step(wf, spec, now, cfg, live_since, state["end_minute"], held, incident_open)
+                self.sched.step(wf, spec, now, cfg, "schedule" in held or "cohorts" in held)
             self.gov.cycle(wf, spec, now, state["end_minute"])
             self._autonomy(wf, spec, now)
         dt = (time.perf_counter() - t0) * 1000

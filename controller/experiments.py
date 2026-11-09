@@ -27,8 +27,8 @@ from .store import Store
 EXP_DIMS = ("welcome_message", "voice")
 
 P = {  # pre-registered parameters (also written into each experiment's `prereg` row)
-    "control_share": 0.40, "holdout": 0.20, "alpha_win": 0.05, "alpha_seg": 0.05, "alpha_harm_drop": 0.01,
-    "veto_z": 1.28, "veto_abs": 0.02, "tau_rel": 0.10, "n_min": 250, "n_seg_min": 150, "min_lift_rel": 0.02,
+    "control_share": 0.40, "holdout": 0.20, "alpha_win": 0.05, "alpha_seg": 0.01, "alpha_harm_drop": 0.01,
+    "veto_z": 1.28, "veto_abs": 0.02, "tau_rel": 0.10, "n_min": 250, "n_seg_min": 300, "min_lift_rel": 0.02, "min_seg_lift_rel": 0.05,
     "max_days": 5.0, "min_days_left": 2.5, "min_conn_per_day": 120, "eval_every_min": 180,
     "mon_min_arm": 300, "mon_min_ctrl": 100, "decay_frac": 0.5, "mon_consecutive": 2, "drop_abs": 0.03,
     "max_override_cohorts": 4,
@@ -408,6 +408,11 @@ class Experiments:
             experiment_id=e["id"])
         reach = 1.0
         for cid, dims in plan_alloc.items():
+            if cid == "default" and winner is None:  # only segment findings: everyone else returns to the incumbent
+                self.plans.set_alloc(wf, cid, dim, dims, {
+                    "kind": "experiment_end", "ref": e["id"], "urgent": False, "decision": did, "reach": 1.0, "exploration": False,
+                    "summary": f"end {dim} test: keep {ctrl} for everyone outside the cohorts below"})
+                continue
             self.plans.set_alloc(wf, cid, dim, dims, {
                 "kind": "promotion", "ref": e["id"], "urgent": False, "decision": did, "reach": reach,
                 "summary": f"promote {winner if cid == 'default' else seg['overrides'].get(cid)} for {dim} "
@@ -458,7 +463,7 @@ class Experiments:
         for k, (ok, adj) in rej.items():
             a, f, v = k
             d, se, na, nc = tests[k]
-            if ok:
+            if ok and d >= P["min_seg_lift_rel"] * 0.55:   # practical significance: >=5% of a ~55% engagement rate
                 cur = findings[f].get(v)
                 lcb = d - 1.645 * se
                 if cur is None or lcb > cur[1]:

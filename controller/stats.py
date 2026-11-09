@@ -79,22 +79,26 @@ def binom_sf(k: int, n: int, p: float) -> float:
 
 
 def stratified_contrast(strata: list[tuple[int, int, int, int]], min_n: int = 20):
-    """Inverse-variance pooled difference of proportions across strata.
+    """Pooled difference of proportions across strata with *sample-size* weights w = n_a*n_c/(n_a+n_c) (the Mantel-Haenszel
+    risk-difference weights). Weights depend only on how many calls each stratum has, never on the outcomes, so the estimate
+    cannot be inflated by cells whose observed rate happens to be extreme (inverse-variance weights can). Variance is
+    sum(w^2 v_s)/(sum w)^2 with smoothed per-stratum variances.
     strata: [(k_a, n_a, k_c, n_c)]. Returns (delta, var, n_a, n_c, used_strata) or None.
     Stratifying by (config version, cohort) keeps the comparison valid even though allocations change over time."""
-    num = den = 0.0
+    num = den = vnum = 0.0
     na = nc = used = 0
     for ka, n_a, kc, n_c in strata:
         if n_a < min_n or n_c < min_n:
             continue
         qa, qc = (ka + 0.5) / (n_a + 1), (kc + 0.5) / (n_c + 1)
         v = qa * (1 - qa) / n_a + qc * (1 - qc) / n_c
-        w = 1.0 / v
+        w = n_a * n_c / (n_a + n_c)
         num += w * (ka / n_a - kc / n_c)
         den += w
+        vnum += w * w * v
         na += n_a
         nc += n_c
         used += 1
     if den <= 0:
         return None
-    return num / den, 1.0 / den, na, nc, used
+    return num / den, vnum / (den * den), na, nc, used

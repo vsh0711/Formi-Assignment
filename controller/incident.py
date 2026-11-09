@@ -57,6 +57,14 @@ class Incidents:
         short = detect.by_did(detect.tick_window(self.agg, wf, now - 6 * 60, now))
         flagged = {b["did"]: b for b in detect.did_degraded(short)}
         fresh = [b for d, b in flagged.items() if d not in known_bad]
+        reparked = [b for b in fresh if live_dist.get(b["did"], 0.0) <= 0.06]
+        if reparked:  # already at its probe floor (expired park re-confirmed): remember it quietly, no new incident
+            known_bad |= {b["did"] for b in reparked}
+            for b in reparked:
+                since[b["did"]] = now
+            self.st.put(f"bad_dids:{wf}", sorted(known_bad))
+            self.st.put(f"bad_dids_since:{wf}", since)
+            fresh = [b for b in fresh if b not in reparked]
         if fresh:
             known_bad |= set(flagged)
             for d in flagged:
@@ -345,22 +353,24 @@ class Incidents:
             self.st.x("UPDATE incidents SET state=? WHERE id=?", (json.dumps(state), iid))
             return
         rec = state["validated"][chosen]
-        state["chosen"], state["phase"], state["proposed_min"] = chosen, "proposed", now
-        self.st.x("UPDATE incidents SET state=? WHERE id=?", (json.dumps(state), iid))
         ev = state["evidence"]
         did = self.audit.decision(
             now, wf, "fix_chosen", f"{chosen} cleared the safety gate", "last-known-good first; else least restrictive passing prompt",
             {"validated": state["validated"], "evidence": ev}, f"plan prompt -> {chosen}",
             f"replace {bad} with {chosen} (validation {rec['run_id']} pass_rate {rec['pass_rate']:.4f}); credits spent {state['spent']}")
         sev = min(1.0, (ev["rate"] - ev["reference_rate"]) / 0.05)
-        self.plans.set_prompt(wf, chosen, {
-            "kind": "incident_fix", "ref": iid, "urgent": True, "safety": True, "severity": sev, "reach": 1.0, "decision": did,
-            "summary": f"replace prompt {bad} with {chosen}: {bad} is producing {ev['ratio']}x the normal rate of flagged answers",
-            "rationale": f"{bad} flag rate {ev['rate']:.1%} vs reference {ev['reference_rate']:.1%} over {ev['connected']} calls; "
-                         f"{chosen} validated at pass_rate {rec['pass_rate']:.4f}",
-            "evidence": {"validation_run_id": rec["run_id"]}, "evidence_text": f"validation {rec['run_id']}",
-            "projection": {"metric": "hallucination_flag_rate", "current": ev["rate"], "reference": ev["reference_rate"],
-                           "validated_failure_rate": round(rec["failures"] / rec["n"], 4)}})
+        # plan first, phase second: a kill in between only re-runs this (validations are cached in `state`, so no re-spend)
+        with self.st.tx():
+            self.plans.set_prompt(wf, chosen, {
+                "kind": "incident_fix", "ref": iid, "urgent": True, "safety": True, "severity": sev, "reach": 1.0, "decision": did,
+                "summary": f"replace prompt {bad} with {chosen}: {bad} is producing {ev['ratio']}x the normal rate of flagged answers",
+                "rationale": f"{bad} flag rate {ev['rate']:.1%} vs reference {ev['reference_rate']:.1%} over {ev['connected']} calls; "
+                             f"{chosen} validated at pass_rate {rec['pass_rate']:.4f}",
+                "evidence": {"validation_run_id": rec["run_id"]}, "evidence_text": f"validation {rec['run_id']}",
+                "projection": {"metric": "hallucination_flag_rate", "current": ev["rate"], "reference": ev["reference_rate"],
+                               "validated_failure_rate": round(rec["failures"] / rec["n"], 4)}})
+            state["chosen"], state["phase"], state["proposed_min"] = chosen, "proposed", now
+            self.st.x("UPDATE incidents SET state=? WHERE id=?", (json.dumps(state), iid))
 
     def _check_rejections(self, wf, now, state, iid):
         if self.st.get(f"evidence_invalid:{wf}"):
@@ -373,37 +383,42 @@ class Incidents:
                                 {}, "restart fix selection", "validation evidence rejected; re-validating")
 
     def _verify_fix(self, wf, spec, now, iid, state, opened):
+        """Close the loop: did the fix work? Statistical, not a single noisy ratio - the same CUSUM that raised the alarm must
+        stay quiet on the new prompt, and engagement must not be significantly lower than before the incident."""
         applied = state.get("applied_min", now)
-        if now - applied < 90:
+        if now - applied < 60:
             return
         chosen = state["chosen"]
         win = detect.tick_window(self.agg, wf, applied, now)
-        rates = detect.prompt_rates(win).get(chosen)
-        if not rates or rates[0] < 150:
-            return
-        ref = self._reference_rate(wf, chosen, now)
-        flag_rate = rates[1] / rates[0]
-        # engagement canary: new prompt vs the pre-incident prompt (same detector window logic, separate KPI)
-        pre = detect.tick_window(self.agg, wf, state.get("opened_min", opened) - 3 * 1440, opened)
+        n_new = sum(v[1] for (d, p), v in win.items() if p == chosen)
+        f_new = sum(v[3] for (d, p), v in win.items() if p == chosen)
         eng_new = sum(v[2] for (d, p), v in win.items() if p == chosen)
-        conn_new = sum(v[1] for (d, p), v in win.items() if p == chosen)
-        base_p = state["bad_prompt"]
-        old = [(k, v) for k, v in pre.items() if k[1] != chosen and k[1] != base_p]
-        e_old, c_old = sum(v[2] for _, v in old), sum(v[1] for _, v in old)
-        diff, z = two_prop(eng_new, conn_new, e_old, c_old) if c_old >= 300 and conn_new >= 150 else (0.0, 0.0)
-        ok_flags = flag_rate <= max(2 * ref, ref + 0.015)
+        ref = self._reference_rate(wf, chosen, now)
+        alarm = detect.halluc_check(self.agg, wf, chosen, now, ref)
+        timed_out = now - applied >= 24 * 60
+        if not alarm and n_new < 300 and not timed_out:
+            return  # not enough evidence yet either way
+        pre = detect.tick_window(self.agg, wf, opened - 3 * 1440, opened)
+        bad = state["bad_prompt"]
+        e_old = sum(v[2] for (d, p), v in pre.items() if p != bad)
+        c_old = sum(v[1] for (d, p), v in pre.items() if p != bad)
+        diff, z = two_prop(eng_new, n_new, e_old, c_old) if c_old >= 300 and n_new >= 200 else (0.0, 0.0)
         ok_eng = not (z <= -2.5 and diff <= -0.03)
-        res = {"flag_rate": round(flag_rate, 4), "reference": round(ref, 4), "connected": rates[0], "engagement_new": round(eng_new / conn_new, 4),
+        res = {"flag_rate": round(f_new / n_new, 4) if n_new else None, "reference": round(ref, 4), "connected_since_apply": n_new,
+               "cusum_alarm": alarm, "engagement_new": round(eng_new / n_new, 4) if n_new else None,
                "engagement_before": round(e_old / c_old, 4) if c_old else None, "engagement_z": round(z, 2)}
-        state["phase"] = "closed" if (ok_flags and ok_eng) else "failed"
+        ok = alarm is None and ok_eng
+        state["phase"] = "closed" if ok else "failed"
         self.st.x("UPDATE incidents SET status=?, closed_min=?, state=? WHERE id=?",
-                  ("closed" if state["phase"] == "closed" else "failed", now, json.dumps(state), iid))
+                  ("closed" if ok else "failed", now, json.dumps(state), iid))
         mttr = applied - opened
-        self.audit.decision(now, wf, "fix_verified" if state["phase"] == "closed" else "fix_failed",
-                            f"post-apply check of {chosen}", "flag rate <= max(2x ref, ref+1.5pt) and engagement not significantly lower",
-                            res, "incident closed" if state["phase"] == "closed" else "escalated",
-                            f"{chosen}: flag rate {flag_rate:.1%} (ref {ref:.1%}); applied {mttr} min after detection")
+        self.audit.decision(now, wf, "fix_verified" if ok else "fix_failed", f"post-apply check of {chosen}",
+                            "CUSUM quiet on the new prompt AND engagement not significantly lower (z>-2.5 or drop<3pt)", res,
+                            "incident closed" if ok else "escalated",
+                            f"{chosen}: flag rate {res['flag_rate']} vs reference {res['reference']} on {n_new} calls; fix live "
+                            f"{mttr} min after detection" + ("" if n_new >= 300 else " (low volume, closed on timeout)"))
         self.audit.resolve_alert(now, wf, "prompt_hallucination")
-        if state["phase"] == "failed":
+        if not ok:
             self.audit.alert(now, "page", wf, "fix_not_effective",
-                             f"{wf}: prompt {chosen} did not restore health ({res}). Review incident {iid}; engagement canary or flags failed.")
+                             f"{wf}: prompt {chosen} did not restore health ({res}). Look at incident {iid} in the audit store; "
+                             "either flags are still elevated or engagement dropped.")
